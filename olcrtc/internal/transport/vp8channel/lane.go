@@ -77,6 +77,9 @@ type dataLane struct {
 	conn func() *kcpConn
 	// window sets the send window of the queue's KCP session, in segments.
 	window func(segments int)
+	// srtt is the smoothed round trip of the queue's KCP session, in ms;
+	// nil where there is none to read. A single-packet lane paces by it.
+	srtt func() int32
 	// name tells the lane apart in the log.
 	name string
 
@@ -101,6 +104,10 @@ type dataLane struct {
 	// it keeps on a path that loses packets.
 	pace   pace
 	frames frameCap
+	// rate paces a single-packet lane in place of both, and busy says the
+	// last flush had something to write, for the writer's pace.
+	rate singleRate
+	busy bool
 	// heldBack says the last flush had a frame to write and did not, because
 	// the publisher's bucket or the lane's own cap held it: the writer loop
 	// reads it so that a held tick does not count as an idle one and turn
@@ -116,11 +123,15 @@ func (l *dataLane) flush(p *streamTransport, write func([]byte) bool) bool {
 	switch {
 	case l.watch(p, now):
 		l.seen.probe() // on the lane's cadence, see kcpConn.probe
+	case p.single:
 	case l.pace.grow(now, cmp.Or(p.growEvery, defaultGrowEvery), p.fullRate()):
 		l.resize(p)
 		if l.pace.rate == 0 {
 			l.frames.handBackToFrames()
 		}
+	}
+	if p.single {
+		return l.flushSingle(p, now, write)
 	}
 	acked := l.sendAcks(p, write)
 	sent := l.send(p, now, write)
@@ -178,6 +189,14 @@ func (l *dataLane) sendAcks(p *streamTransport, write func([]byte) bool) bool {
 	l.ackPending = pending
 	_ = write(sample)
 	l.ackBuf = sample[:0]
+	// A single-packet sample holds a few dozen acknowledgements, so the rest
+	// of a backlog goes in more of them, up to singleAckSamples a tick.
+	for n := 1; p.single && l.ackPending != nil && n < singleAckSamples; n++ {
+		first, l.ackPending = l.ackPending, nil
+		sample, l.ackPending = p.batchSampleFrom(l.acks, first, l.ackBuf[:0])
+		_ = write(sample)
+		l.ackBuf = sample[:0]
+	}
 	return true
 }
 
@@ -192,6 +211,7 @@ func (l *dataLane) watch(p *streamTransport, now int64) bool {
 			l.seen.hold(0)
 		}
 		l.seen, l.pushSince, l.darkSince, l.pace, l.frames = conn, 0, 0, pace{}, frameCap{}
+		l.rate = singleRate{}
 	}
 	if conn == nil {
 		return false
@@ -206,7 +226,12 @@ func (l *dataLane) watch(p *streamTransport, now int64) bool {
 		conn.hold(cmp.Or(p.probeEvery, defaultProbeEvery))
 		l.sift()
 		frames := ""
-		if l.frames.halve(p.fullPackets()) {
+		switch {
+		case p.single:
+			l.rate.halve(now, l.frames.newest)
+			l.resizeSingle(p)
+			frames = fmt.Sprintf(", %d KiB/s from now", int(l.rate.rate)>>10)
+		case l.frames.halve(p.fullPackets()):
 			l.resize(p)
 			frames = ", " + l.frameNote()
 		}
@@ -228,7 +253,8 @@ func (l *dataLane) watch(p *streamTransport, now int64) bool {
 func (l *dataLane) settle(p *streamTransport, now int64) {
 	held := time.Duration(now - l.darkSince)
 	after := ""
-	if held >= cmp.Or(p.blackoutAfter, defaultBlackoutAfter)/2 && l.pace.slow(now, l.darkRate, p.fullRate()) {
+	if !p.single && held >= cmp.Or(p.blackoutAfter, defaultBlackoutAfter)/2 &&
+		l.pace.slow(now, l.darkRate, p.fullRate()) {
 		l.resize(p)
 		after = fmt.Sprintf(", at most %d KiB/s from now", int(l.pace.rate)>>10)
 	}
@@ -442,4 +468,112 @@ func answers(packet []byte) bool {
 	}
 	cmd := packet[kcpCmdOff]
 	return cmd == kcp.IKCP_CMD_ACK || cmd == kcp.IKCP_CMD_WINS
+}
+
+// The data lane on a single-packet transport (writer.go): every sample one
+// RTP packet, several a tick, paced by singleRate instead of the frame cap
+// and the pace, which size multi-packet frames.
+
+// singleAckSamples caps the acknowledgement samples a lane writes in one
+// tick: a backlog of them should not hold the data back for long.
+const singleAckSamples = 16
+
+// flushSingle is flush's tail on a single-packet transport: the
+// acknowledgements, this tick's data, and the rate weighed against what
+// came back.
+func (l *dataLane) flushSingle(p *streamTransport, now int64, write func([]byte) bool) bool {
+	acked := l.sendAcks(p, write)
+	sent := l.sendSingles(p, now, write)
+	l.busy = sent || acked || l.heldBack
+	if l.seen == nil {
+		return sent || acked
+	}
+	srtt := int32(0)
+	if l.srtt != nil {
+		srtt = l.srtt()
+	}
+	share, changed := l.rate.judge(&l.seen.delivery, now, l.frames.newest, srtt)
+	if changed || now-l.rate.sizedAt > int64(time.Second) {
+		l.rate.sizedAt = now
+		l.resizeSingle(p)
+	}
+	if changed {
+		logger.Debugf("vp8channel: %s: %d%% of pushed packets answered, round trip %d ms, %d KiB/s from now",
+			l.name, int(share*100), srtt, int(l.rate.rate)>>10)
+	}
+	return sent || acked
+}
+
+// sendSingles writes the queued packets as single-packet samples, as many as
+// the rate's credit and singleSamplesPerTick allow, and reports whether it
+// wrote any.
+func (l *dataLane) sendSingles(p *streamTransport, now int64, write func([]byte) bool) bool {
+	if l.rate.start(now) {
+		l.resizeSingle(p)
+	}
+	sent := false
+	for range singleSamplesPerTick {
+		if l.rate.allow(now) < singleSampleSize/2 {
+			l.heldBack = l.pending != nil || len(l.out) > 0
+			return sent
+		}
+		frame := l.takeFreshSingle(now)
+		if frame == nil {
+			break
+		}
+		// The publisher's bucket (olcrtc#26), as in send.
+		if !p.readyToSend(frame.data) {
+			l.pending, l.heldBack = frame, true
+			return sent
+		}
+		var sample []byte
+		batched := p.canBatch(frame.data)
+		if batched {
+			sample, l.pending = p.batchSampleUpTo(l.out, frame, l.batchBuf[:0], p.batchSize)
+			l.batchBuf = sample[:0]
+		} else {
+			sample = frame.data
+		}
+		if write(sample) && l.notePushes(sample) && l.pushSince == 0 {
+			l.pushSince = now
+		}
+		if !batched {
+			frame.release()
+		}
+		l.rate.wrote(len(sample))
+		sent = true
+	}
+	l.heldBack = false
+	return sent
+}
+
+// resizeSingle sets the KCP send window to the lane's current rate over the
+// unloaded round trip (singleRate.window).
+func (l *dataLane) resizeSingle(p *streamTransport) {
+	if l.window != nil {
+		l.window(l.rate.window(p.sendWindow, p.kcpSegmentSize()))
+	}
+}
+
+// stale reports whether a queued packet is a push that has waited past
+// singleStale; what answers the peer is never stale.
+func stale(frame *packetBuffer, now int64) bool {
+	if now-frame.queued <= int64(singleStale) {
+		return false
+	}
+	return len(frame.data) <= epochHdrLen || !answers(frame.data[epochHdrLen:])
+}
+
+// takeFreshSingle is takeFresh for a single-packet lane: pushes that waited
+// past singleStale are dropped on the way, whatever the lane's rate; KCP
+// resends what it still needs.
+func (l *dataLane) takeFreshSingle(now int64) *packetBuffer {
+	for range cap(l.out) + 1 {
+		frame := l.take()
+		if frame == nil || !stale(frame, now) {
+			return frame
+		}
+		frame.release()
+	}
+	return nil
 }

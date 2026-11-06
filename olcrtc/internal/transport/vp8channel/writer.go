@@ -2,6 +2,8 @@ package vp8channel
 
 import (
 	"encoding/binary"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pion/webrtc/v4/pkg/media"
@@ -38,7 +40,8 @@ func newWriterState(p *streamTransport) *writerState {
 		forceKeepaliveEvery: max(int(forceKeepalivePeriod/p.frameInterval), 1),
 		keyframeGap:         max(int(keyframeRequestGap/p.frameInterval), 1),
 		data: dataLane{
-			out: p.data.out, acks: p.data.acks, conn: p.dataConn, window: p.dataWindow, name: "data",
+			out: p.data.out, acks: p.data.acks, conn: p.dataConn, window: p.dataWindow, srtt: p.dataSRTT,
+			name: "data",
 		},
 	}
 }
@@ -51,7 +54,7 @@ func (w *writerState) releasePending() {
 }
 
 func (w *writerState) writeSample(data []byte) bool {
-	return w.p.writeSampleLocked(data)
+	return w.p.writeFrameLocked(data)
 }
 
 // writeSampleLocked serializes every WriteSample call on the shared video
@@ -99,7 +102,7 @@ func (p *streamTransport) writeLocked(data []byte, keyframe bool) bool {
 	} else {
 		written = p.track.WriteSample(media.Sample{
 			Data:     data,
-			Duration: p.frameInterval,
+			Duration: p.sampleDuration(time.Now()),
 		}) == nil
 	}
 	if written {
@@ -125,7 +128,17 @@ func (p *streamTransport) readyToSend(frame []byte) bool {
 // A relay that asks for one (requestKeyframe) is answered on the next tick
 // rather than at the next beat, keyframeGap ticks after the last at the
 // soonest: until it has a keyframe it forwards nothing of the track.
+//
+// A single-packet transport writes keyframes on its own schedule instead
+// (keyframeSchedule): every one costs the stream what the relay holds of it.
 func (w *writerState) forceKeepalive() {
+	if w.p.single {
+		if w.p.keyframes.due(time.Now()) {
+			hdr := w.p.epochHeader()
+			_ = w.p.writeSampleLocked(hdr[:])
+		}
+		return
+	}
 	w.ticksSinceKeepalive++
 	due := w.ticksSinceKeepalive >= w.forceKeepaliveEvery
 	if !due && w.ticksSinceKeepalive >= w.keyframeGap && w.p.keyframeWanted.Load() {
@@ -213,7 +226,7 @@ func (w *writerState) batchDatagramSampleFrom(src <-chan []byte, first []byte) [
 	if len(first) <= epochHdrLen || w.p.batchSize <= 1 {
 		return first
 	}
-	sample := make([]byte, 0, defaultMaxPayloadSize)
+	sample := make([]byte, 0, w.p.sampleBudget())
 	sample = append(sample, first[:epochHdrLen]...)
 	sample = append(sample, datagramBatchMagic[:]...)
 	sample = appendBatchPacket(sample, first[epochHdrLen:])
@@ -225,7 +238,7 @@ func (w *writerState) batchDatagramSampleFrom(src <-chan []byte, first []byte) [
 				return sample
 			}
 			payload := frame[epochHdrLen:]
-			if len(sample)+2+len(payload) > defaultMaxPayloadSize {
+			if len(sample)+2+len(payload) > w.p.sampleBudget() {
 				w.pendingDatagram = frame
 				return sample
 			}
@@ -273,6 +286,15 @@ func (p *streamTransport) dataConn() *kcpConn {
 	return nil
 }
 
+// dataSRTT is the single-peer data plane's smoothed KCP round trip in ms,
+// zero while the plane is down.
+func (p *streamTransport) dataSRTT() int32 {
+	if rt := p.data.get(); rt != nil {
+		return rt.sess.GetSRTT()
+	}
+	return 0
+}
+
 // dataWindow sets the single-peer data plane's KCP send window.
 //
 // ai-generated: the whole function.
@@ -285,8 +307,9 @@ func (p *streamTransport) dataWindow(segments int) {
 func (p *streamTransport) writerLoop() {
 	defer close(p.writerDone)
 
-	ticker := time.NewTicker(p.frameInterval)
+	ticker := time.NewTicker(p.writeTick())
 	defer ticker.Stop()
+	pace := writerPace{ticker: ticker, fast: true}
 
 	w := newWriterState(p)
 	defer w.releasePending()
@@ -308,6 +331,7 @@ func (p *streamTransport) writerLoop() {
 			}
 			// Priority 3: drain a batched data frame (or send keepalive).
 			w.drainData()
+			pace.note(p, w.data.busy)
 		}
 	}
 }
@@ -324,8 +348,9 @@ func (p *streamTransport) writerLoop() {
 //
 // ai-generated: the lane in place of the pump's own batching.
 func (p *streamTransport) peerWriterPump(lane dataLane, done <-chan struct{}) {
-	ticker := time.NewTicker(p.frameInterval)
+	ticker := time.NewTicker(p.writeTick())
 	defer ticker.Stop()
+	pace := writerPace{ticker: ticker, fast: true}
 
 	// Inject a decodable VP8 keyframe on the same cadence writerLoop uses for
 	// the client->server path. The server's per-peer bulk path previously
@@ -346,13 +371,16 @@ func (p *streamTransport) peerWriterPump(lane dataLane, done <-chan struct{}) {
 		case <-done:
 			return
 		case <-ticker.C:
+			// A single-packet transport's keyframes all come from
+			// writerLoop, which runs on the server as well (keyframeSchedule).
 			ticksSinceKeyframe++
-			if ticksSinceKeyframe >= keyframeEvery {
+			if !p.single && ticksSinceKeyframe >= keyframeEvery {
 				ticksSinceKeyframe = 0
 				hdr := p.epochHeader()
 				_ = p.writeSampleLocked(hdr[:])
 			}
-			lane.flush(p, p.writeSampleLocked)
+			lane.flush(p, p.writeFrameLocked)
+			pace.note(p, lane.busy)
 		}
 	}
 }
@@ -388,7 +416,7 @@ func (p *streamTransport) batchSampleUpTo(
 		return first.data, nil
 	}
 
-	sample := prepareBatchBuffer(dst, src, first.data, limit)
+	sample := prepareBatchBuffer(dst, src, first.data, limit, p.sampleBudget())
 	sample = append(sample, first.data[:epochHdrLen]...)
 	sample = append(sample, kcpBatchMagic[:]...)
 	sample = appendBatchPacket(sample, first.data[epochHdrLen:])
@@ -405,7 +433,7 @@ func (p *streamTransport) batchSampleUpTo(
 				continue
 			}
 			payload := frame.data[epochHdrLen:]
-			if len(sample)+2+len(payload) > defaultMaxPayloadSize {
+			if len(sample)+2+len(payload) > p.sampleBudget() {
 				return sample, frame
 			}
 			sample = appendBatchPacket(sample, payload)
@@ -417,12 +445,12 @@ func (p *streamTransport) batchSampleUpTo(
 	return sample, nil
 }
 
-func prepareBatchBuffer(dst []byte, src <-chan *packetBuffer, first []byte, limit int) []byte {
+func prepareBatchBuffer(dst []byte, src <-chan *packetBuffer, first []byte, limit, budget int) []byte {
 	packetSize := len(first) - epochHdrLen
 	packetCount := max(min(limit, len(src)+1), 1)
 	want := epochHdrLen + len(kcpBatchMagic) + packetCount*(batchLenLen+packetSize)
-	if want > defaultMaxPayloadSize {
-		want = defaultMaxPayloadSize
+	if want > budget {
+		want = budget
 	}
 	if cap(dst) < want {
 		return make([]byte, 0, want)
@@ -441,4 +469,225 @@ func appendBatchPacket(dst, packet []byte) []byte {
 	binary.BigEndian.PutUint16(lenBuf[:], uint16(len(packet))) //nolint:gosec // bounded above
 	dst = append(dst, lenBuf[:]...)
 	return append(dst, packet...)
+}
+
+// Single-packet frames, for a relay that forwards nothing else reliably.
+//
+// Telemost's media server changed how it forwards VP8 in early October 2026.
+// Measured against a live room from a datacenter on 2026-10-10:
+//
+//   - a keyframe of 5 KB or more is dropped outright, every packet of it,
+//     and one of 2-3 KB loses most of its packets;
+//   - a frame spread over several RTP packets mostly arrives incomplete: of
+//     interframes of 3 KB at 120 a second, 18% got through whole;
+//   - every keyframe drops what the server still holds of the stream, about
+//     a third of a second of it: with a keyframe every second, 1000-byte
+//     interframes got through 66% of the time, at any rate, and with one
+//     every ten seconds 97%, even at 30 Mbit/s.
+//
+// This transport used to send every data frame as a keyframe of up to 60 KB
+// and a bare keyframe on every idle tick, so through Telemost nothing but
+// the smallest frames arrived, and a download stalled at 0 B/s. An engine
+// whose relay behaves like that says so (engine.SinglePacketRelay), and the
+// transport then publishes every frame as one RTP packet (singleSampleSize),
+// data and idle keepalives as interframes, a keyframe only to start the
+// stream, when the relay asks for one and every singleKeyframePeriod, and
+// paces what it writes at what comes back acknowledged (singleRate). The
+// same datacenter pair then moved 10 MB down at 3.8 Mbit/s and 2 MB up at
+// 2 Mbit/s.
+//
+// Frames stay what the receiver has always read: it ignores the first 20
+// bytes, where the VP8 header sits, so a peer on the previous framing reads
+// these frames, and these peers read its.
+
+const (
+	// singleSampleSize is the largest VP8 sample pion sends as one RTP
+	// packet: its 1200-byte MTU less the 12-byte RTP header and the 4-byte
+	// VP8 descriptor with a picture id, with 4 bytes to spare. Telemost
+	// forwarded frames of 1180 bytes as reliably as frames of 1000; at 1190
+	// they took two packets and less than half arrived.
+	singleSampleSize = 1180
+	// singleKCPMTU is the KCP segment size that keeps one segment, its CRC
+	// and the batch framing inside singleSampleSize.
+	singleKCPMTU = 1100
+	// singleTick is how often the writers run while data flows: at the
+	// rates this relay carries, a frame every 2 ms per sample is what keeps
+	// the stream smooth instead of bursting a tick's worth at once.
+	singleTick = 2 * time.Millisecond
+	// singleIdleTicks is how many fast ticks with nothing to write the
+	// writers wait before they fall back to the frame interval, so an idle
+	// tunnel does not wake the process 500 times a second.
+	singleIdleTicks = 50
+	// singleSamplesPerTick caps the samples a data lane writes in one tick.
+	singleSamplesPerTick = 8
+	// singleKeyframePeriod is how often a keyframe goes out on its own. The
+	// relay stops forwarding a stream that has gone too long without one
+	// (about 40 s), and each keyframe costs the third of a second the relay
+	// holds, so one every 20 s.
+	singleKeyframePeriod = 20 * time.Second
+	// singleKeyframeWarmup is how long a stream sends a keyframe every
+	// singleKeyframeWarmupEvery after it starts: the relay forwards nothing
+	// to a subscriber until it has a keyframe, and a lost first one would
+	// otherwise cost a whole period.
+	singleKeyframeWarmup      = 2 * time.Second
+	singleKeyframeWarmupEvery = 500 * time.Millisecond
+	// singleKeyframeGap is the least time between two keyframes: requests
+	// come in bursts when several subscribers join.
+	singleKeyframeGap = 300 * time.Millisecond
+	// singleStale is how long a push may wait in a lane's queue. Past that
+	// KCP has most likely sent it again, and a queue that keeps it only
+	// delays the rest: the round trip KCP measures grows with the queue,
+	// its timeouts with the round trip, and the lane stalls on them.
+	singleStale = 250 * time.Millisecond
+	// vp8PrefixLen is how many bytes at the head of a frame the VP8 header
+	// takes; the epoch header starts after it (wire.go).
+	vp8PrefixLen = tokenOff
+)
+
+// vp8Interframe is a minimal VP8 interframe, padded to vp8PrefixLen. It
+// heads every frame a single-packet transport writes except its keyframes.
+var vp8Interframe = []byte{ //nolint:gochecknoglobals // wire constant
+	0xb1, 0x01, 0x00, 0x08, 0x11, 0x18, 0x00, 0x18,
+	0x00, 0x18, 0x58, 0x2f, 0xf4, 0x00, 0x08, 0x00,
+	0x00, 0x00, 0x00, 0x00,
+}
+
+// asInterframe rewrites the VP8 header of a sample about to be written into
+// an interframe. The sample is the writer's own (a pooled packet, a batch
+// buffer or a header copy), so it is rewritten in place.
+func asInterframe(sample []byte) {
+	if len(sample) >= vp8PrefixLen {
+		copy(sample[:vp8PrefixLen], vp8Interframe)
+	}
+}
+
+// writeFrameLocked is writeSampleLocked for every frame but a keyframe: on a
+// single-packet transport it heads the frame with the interframe header
+// first. Keyframes go to writeSampleLocked as they are.
+func (p *streamTransport) writeFrameLocked(data []byte) bool {
+	if p.single {
+		asInterframe(data)
+	}
+	return p.writeSampleLocked(data)
+}
+
+// sampleBudget is the most bytes the transport puts in one sample.
+func (p *streamTransport) sampleBudget() int {
+	if p.single {
+		return singleSampleSize
+	}
+	return defaultMaxPayloadSize
+}
+
+// kcpSegmentSize is the KCP MTU of this transport's sessions.
+func (p *streamTransport) kcpSegmentSize() int {
+	if p.single {
+		return singleKCPMTU
+	}
+	return kcpMTU
+}
+
+// sampleDuration is how far the RTP clock moves after a sample. A
+// single-packet transport writes several samples a tick, so it moves the
+// clock by the time since the previous sample, keeping it on the wall clock;
+// otherwise a sample is a frame interval. The caller holds writeMu.
+func (p *streamTransport) sampleDuration(now time.Time) time.Duration {
+	if !p.single {
+		return p.frameInterval
+	}
+	d := now.Sub(p.lastSampleAt)
+	p.lastSampleAt = now
+	switch {
+	case d < time.Second/90000+time.Microsecond: // one tick of the 90 kHz clock
+		d = time.Second/90000 + time.Microsecond
+	case d > time.Second:
+		d = p.frameInterval
+	}
+	return d
+}
+
+// writeTick is how often the writers run: a single-packet transport runs
+// fast while data flows (see writerPace).
+func (p *streamTransport) writeTick() time.Duration {
+	if p.single {
+		return singleTick
+	}
+	return p.frameInterval
+}
+
+// writerPace switches a single-packet writer's ticker between singleTick
+// while it writes and the frame interval once it has been idle for
+// singleIdleTicks ticks.
+type writerPace struct {
+	ticker *time.Ticker
+	fast   bool
+	idle   int
+}
+
+// note records whether this tick wrote anything and retunes the ticker.
+func (w *writerPace) note(p *streamTransport, busy bool) {
+	if !p.single {
+		return
+	}
+	switch {
+	case busy:
+		w.idle = 0
+		if !w.fast {
+			w.fast = true
+			w.ticker.Reset(singleTick)
+		}
+	case w.fast:
+		w.idle++
+		if w.idle >= singleIdleTicks {
+			w.fast = false
+			w.ticker.Reset(p.frameInterval)
+		}
+	}
+}
+
+// keyframeSchedule decides when a single-packet transport writes a
+// keyframe: every singleKeyframeWarmupEvery while the stream warms up, at
+// a request from the relay, and every singleKeyframePeriod, never two
+// within singleKeyframeGap.
+type keyframeSchedule struct {
+	requested atomic.Bool
+
+	mu    sync.Mutex
+	start time.Time
+	last  time.Time
+}
+
+// request marks a keyframe as wanted; the relay's keyframe requests call it.
+func (k *keyframeSchedule) request() { k.requested.Store(true) }
+
+// due reports whether a keyframe goes out now and, when it does, counts it
+// as sent.
+func (k *keyframeSchedule) due(now time.Time) bool {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if k.start.IsZero() {
+		k.start = now
+	}
+	since := now.Sub(k.last)
+	if !k.last.IsZero() && since < singleKeyframeGap {
+		return false
+	}
+	switch {
+	case k.last.IsZero(),
+		now.Sub(k.start) < singleKeyframeWarmup && since >= singleKeyframeWarmupEvery,
+		since >= singleKeyframePeriod,
+		k.requested.Load():
+	default:
+		return false
+	}
+	k.requested.Store(false)
+	k.last = now
+	return true
+}
+
+// restart warms the stream up again, as a provider rebuild starts a new one.
+func (k *keyframeSchedule) restart() {
+	k.mu.Lock()
+	k.start, k.last = time.Time{}, time.Time{}
+	k.mu.Unlock()
 }

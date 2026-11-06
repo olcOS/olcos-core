@@ -149,6 +149,14 @@ func startKCP(
 func startKCPAcks(
 	out, acks chan<- *packetBuffer, onData func([]byte), epochHdr [epochHdrLen]byte, sndWnd int,
 ) (*kcpRuntime, error) {
+	return startKCPWith(out, acks, onData, epochHdr, sndWnd, 0)
+}
+
+// startKCPWith is startKCPAcks with the KCP MTU; 0 takes kcpMTU. A
+// single-packet transport (writer.go) runs smaller segments.
+func startKCPWith(
+	out, acks chan<- *packetBuffer, onData func([]byte), epochHdr [epochHdrLen]byte, sndWnd, mtu int,
+) (*kcpRuntime, error) {
 	c := newKCPConn(out, inboundQueueSizeFor(), epochHdr)
 	c.acks = acks
 
@@ -171,7 +179,10 @@ func startKCPAcks(
 		sndWnd = kcpSendWindow(false)
 	}
 	sess.SetWindowSize(sndWnd, kcpRcvWindow())
-	sess.SetMtu(kcpMTU)
+	if mtu <= 0 {
+		mtu = kcpMTU
+	}
+	sess.SetMtu(mtu)
 	// Upstream marked SetStreamMode deprecated without providing a replacement;
 	// stream framing is still required for our wire format.
 	sess.SetStreamMode(true) //nolint:staticcheck // SA1019: no replacement upstream.
@@ -275,6 +286,8 @@ type kcpPlane struct {
 	// sndWnd is the KCP send window its sessions run with; 0 takes this
 	// host's profile. The transport sets it. ai-generated (olcrtc#26).
 	sndWnd int
+	// mtu is the KCP MTU of the plane's sessions; 0 takes kcpMTU.
+	mtu int
 
 	// lifecycleMu serializes start/restart/close. Without it two concurrent
 	// restarts - a provider reconnect and an upper-layer ResetPeer fire
@@ -335,7 +348,7 @@ func (p *kcpPlane) start(hdr [epochHdrLen]byte) (bool, error) {
 			return
 		}
 		var rt *kcpRuntime
-		rt, err = startKCPAcks(p.out, p.acks, p.onData, hdr, p.sndWnd)
+		rt, err = startKCPWith(p.out, p.acks, p.onData, hdr, p.sndWnd, p.mtu)
 		if err != nil {
 			return
 		}
@@ -367,7 +380,7 @@ func (p *kcpPlane) restart(hdr [epochHdrLen]byte) {
 		old.close()
 	}
 
-	rt, err := startKCPAcks(p.out, p.acks, p.onData, hdr, p.sndWnd)
+	rt, err := startKCPWith(p.out, p.acks, p.onData, hdr, p.sndWnd, p.mtu)
 	if err != nil {
 		return
 	}

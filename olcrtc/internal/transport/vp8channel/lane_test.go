@@ -4,6 +4,7 @@ package vp8channel
 // stops forwarding a stream over its budget).
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/binary"
@@ -13,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pion/rtp/codecs"
 	kcp "github.com/xtaci/kcp-go/v5"
 
 	"github.com/openlibrecommunity/olcrtc/internal/transport"
@@ -457,5 +459,386 @@ func TestCappedLaneDropsStalePushesButNotAnswers(t *testing.T) {
 	queue(stale, kcp.IKCP_CMD_PUSH)
 	if got := l.takeFresh(now); got == nil {
 		t.Fatal("takeFresh() dropped a stale push on an uncapped lane")
+	}
+}
+
+// The single-packet framing (writer.go): what a transport whose engine's
+// relay is Telemost writes, and how it paces it. The relay's behaviour it
+// answers to was measured live; these tests pin the transport's side.
+
+func singleTransport() (*streamTransport, *[][]byte) {
+	var written [][]byte
+	p := &streamTransport{
+		single:        true,
+		frameInterval: time.Second / 60,
+		batchSize:     64,
+		sendWindow:    kcpSndWnd,
+		bindingToken:  7,
+		localEpoch:    0x11223344,
+	}
+	p.sampleWriter = func(b []byte) bool {
+		written = append(written, append([]byte(nil), b...))
+		return true
+	}
+	return p, &written
+}
+
+func TestSingleSampleIsOneRTPPacket(t *testing.T) {
+	// pion packetizes a sample with its 1200-byte MTU less the RTP header,
+	// and its VP8 payloader with a picture id, which takes up to four bytes
+	// of descriptor once the id passes 127.
+	payloader := &codecs.VP8Payloader{EnablePictureID: true}
+	sample := make([]byte, singleSampleSize)
+	for range 200 { // walk the picture id past 127
+		if n := len(payloader.Payload(1200-12, sample)); n != 1 {
+			t.Fatalf("a %d-byte sample took %d packets", singleSampleSize, n)
+		}
+	}
+	if n := len(payloader.Payload(1200-12, make([]byte, singleSampleSize+8))); n < 2 {
+		t.Fatalf("the budget has no margin: %d bytes still fit one packet", singleSampleSize+8)
+	}
+	// One KCP segment, its CRC and the batch framing fit the budget.
+	if want := epochHdrLen + len(kcpBatchMagic) + batchLenLen + singleKCPMTU + wireCRCLen; want > singleSampleSize {
+		t.Fatalf("a full segment makes a %d-byte sample, over %d", want, singleSampleSize)
+	}
+}
+
+func TestSingleTransportWritesInterframesAndKeyframes(t *testing.T) {
+	p, written := singleTransport()
+	hdr := p.epochHeader()
+	data := append(hdr[:], []byte("payload")...)
+	if !p.writeFrameLocked(data) {
+		t.Fatal("write failed")
+	}
+	key := p.epochHeader()
+	if !p.writeSampleLocked(key[:]) {
+		t.Fatal("keyframe write failed")
+	}
+	if got := (*written)[0][:vp8PrefixLen]; !bytes.Equal(got, vp8Interframe) {
+		t.Fatalf("data went out as % x, want the interframe header", got)
+	}
+	if got := (*written)[1][:len(vp8Keepalive)]; !bytes.Equal(got, vp8Keepalive) {
+		t.Fatalf("keyframe went out as % x, want the keyframe header", got)
+	}
+	// The receiver reads the epoch header behind either.
+	for i, frame := range *written {
+		token, src, _, ok := parseEpochHeader(frame)
+		if !ok || token != p.bindingToken || src != p.localEpochValue() {
+			t.Fatalf("frame %d: epoch header unreadable (ok=%v token=%x src=%x)", i, ok, token, src)
+		}
+	}
+	if !bytes.Equal((*written)[0][epochHdrLen:], []byte("payload")) {
+		t.Fatal("the payload changed")
+	}
+}
+
+func TestOtherRelaysKeepTheKeyframeFraming(t *testing.T) {
+	p, written := singleTransport()
+	p.single = false
+	hdr := p.epochHeader()
+	_ = p.writeFrameLocked(append(hdr[:], 1, 2, 3))
+	if got := (*written)[0][:len(vp8Keepalive)]; !bytes.Equal(got, vp8Keepalive) {
+		t.Fatalf("a multi-packet relay's frame went out as % x", got)
+	}
+	if p.sampleBudget() != defaultMaxPayloadSize || p.kcpSegmentSize() != kcpMTU || p.writeTick() != p.frameInterval {
+		t.Fatal("a multi-packet relay's transport changed its sizes or cadence")
+	}
+	if d := p.sampleDuration(time.Now()); d != p.frameInterval {
+		t.Fatalf("sample duration %v, want the frame interval", d)
+	}
+}
+
+func TestSingleSampleDurationFollowsTheWallClock(t *testing.T) {
+	p, _ := singleTransport()
+	start := time.Now()
+	p.lastSampleAt = start
+	if d := p.sampleDuration(start.Add(3 * time.Millisecond)); d != 3*time.Millisecond {
+		t.Fatalf("3 ms apart moved the clock %v", d)
+	}
+	// Two samples in the same instant still move the 90 kHz clock a tick.
+	if d := p.sampleDuration(start.Add(3 * time.Millisecond)); d < time.Second/90000 {
+		t.Fatalf("back-to-back samples moved the clock %v, under a tick", d)
+	}
+	// A sample after a long silence moves it a frame, not the silence.
+	if d := p.sampleDuration(start.Add(time.Minute)); d != p.frameInterval {
+		t.Fatalf("a sample after a minute moved the clock %v", d)
+	}
+}
+
+func TestKeyframeSchedule(t *testing.T) {
+	var k keyframeSchedule
+	t0 := time.Unix(1000, 0)
+	if !k.due(t0) {
+		t.Fatal("the first tick sends no keyframe")
+	}
+	if k.due(t0.Add(100 * time.Millisecond)) {
+		t.Fatal("two keyframes inside the gap")
+	}
+	if !k.due(t0.Add(singleKeyframeWarmupEvery)) {
+		t.Fatal("no keyframe while the stream warms up")
+	}
+	last := t0.Add(singleKeyframeWarmupEvery)
+	for at := last.Add(singleKeyframeWarmupEvery); at.Before(t0.Add(singleKeyframeWarmup)); at = at.Add(singleKeyframeWarmupEvery) {
+		if !k.due(at) {
+			t.Fatalf("no warm-up keyframe at %v", at.Sub(t0))
+		}
+		last = at
+	}
+	// After the warm-up only the period, or a request, sends one.
+	for at := last.Add(time.Second); at.Before(last.Add(singleKeyframePeriod)); at = at.Add(time.Second) {
+		if k.due(at) {
+			t.Fatalf("an unasked keyframe %v after the last", at.Sub(last))
+		}
+	}
+	at := last.Add(singleKeyframePeriod)
+	if !k.due(at) {
+		t.Fatal("no keyframe after a whole period")
+	}
+	k.request()
+	if k.due(at.Add(100 * time.Millisecond)) {
+		t.Fatal("a request answered inside the gap")
+	}
+	if !k.due(at.Add(singleKeyframeGap)) {
+		t.Fatal("a request went unanswered")
+	}
+	if k.due(at.Add(singleKeyframeGap + time.Second)) {
+		t.Fatal("one request answered twice")
+	}
+	k.restart()
+	if !k.due(at.Add(singleKeyframeGap + 2*time.Second)) {
+		t.Fatal("a rebuilt stream does not warm up again")
+	}
+}
+
+// judged fills a delivery track with pushes at 10 ms intervals for a second,
+// acks share of them, and acknowledges one push past them, so the second
+// is all there is to judge.
+func judged(share float64) *deliveryTrack {
+	track := &deliveryTrack{}
+	const pushes = 100
+	for i := range pushes {
+		ts := uint32(i * 10)
+		track.count(ts, 1, 0, 1)
+		if float64(i) < share*pushes {
+			track.count(ts, 0, 1, 0)
+		}
+	}
+	track.count(5000, 1, 0, 1)
+	track.count(5000, 0, 1, 0)
+	return track
+}
+
+func TestSingleRateGrowsHoldsAndCuts(t *testing.T) {
+	sec := int64(time.Second)
+	cases := []struct {
+		name      string
+		share     float64
+		srtt, min int32
+		want      float64
+	}{
+		{"answered, no queue", 0.95, 300, 300, singleStartRate * singleGrow},
+		{"answered, the relay's usual queue", 0.95, 800, 300, singleStartRate * singleGrow},
+		{"answered, queue past growth", 0.95, 1050, 300, singleStartRate},
+		{"answered, queue past a second", 0.95, 1400, 300, singleStartRate * singleCut},
+		{"fair share", 0.75, 300, 300, singleStartRate},
+		{"lossy", 0.5, 300, 300, singleStartRate * singleCut},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var r singleRate
+			r.start(sec)
+			r.minRTT, r.minAt = c.min, sec
+			r.judge(judged(c.share), 3*sec, 1, c.srtt)
+			if r.rate != c.want {
+				t.Fatalf("rate %.0f, want %.0f", r.rate, c.want)
+			}
+		})
+	}
+}
+
+func TestSingleRateWaitsForEvidenceAndTime(t *testing.T) {
+	sec := int64(time.Second)
+	var r singleRate
+	r.start(sec)
+	if _, changed := r.judge(judged(1), sec+sec/2, 1, 300); changed {
+		t.Fatal("the rate changed within a second of the last change")
+	}
+	r = singleRate{}
+	r.start(sec)
+	if _, changed := r.judge(&deliveryTrack{}, 5*sec, 1, 300); changed {
+		t.Fatal("the rate changed on no evidence")
+	}
+}
+
+func TestSingleRateFloorCeilingAndDark(t *testing.T) {
+	r := singleRate{rate: singleMinRate}
+	r.halve(0, 0)
+	if r.rate != singleMinRate {
+		t.Fatalf("halved below the floor: %.0f", r.rate)
+	}
+	r = singleRate{rate: singleMaxRate}
+	r.changedAt = 0
+	r.judge(judged(1), 10*int64(time.Second), 1, 100)
+	if r.rate > singleMaxRate {
+		t.Fatalf("grew past the ceiling: %.0f", r.rate)
+	}
+	var fresh singleRate
+	fresh.halve(0, 0)
+	if fresh.rate != singleStartRate/2 {
+		t.Fatalf("a lane dark before it wrote halves from the start rate, got %.0f", fresh.rate)
+	}
+}
+
+func TestSingleRateWindow(t *testing.T) {
+	// The window is sized from the floor (minRTT), not the current round trip.
+	r := singleRate{rate: 1 << 20, minRTT: 500}
+	want := int(float64(1<<20)*(0.5+singleWindowSlack.Seconds())) / singleKCPMTU
+	if got := r.window(4096, singleKCPMTU); got != want {
+		t.Fatalf("window %d, want %d", got, want)
+	}
+	if got := r.window(64, singleKCPMTU); got != 64 {
+		t.Fatalf("window %d over the ceiling of 64", got)
+	}
+	// Before a floor is known, the assumed base keeps the window bounded.
+	r = singleRate{rate: 1 << 20}
+	wantBase := int(float64(1<<20)*(singleWindowBase.Seconds()+singleWindowSlack.Seconds())) / singleKCPMTU
+	if got := r.window(4096, singleKCPMTU); got != wantBase {
+		t.Fatalf("window %d with no floor yet, want %d", got, wantBase)
+	}
+	// A low rate never drops below the floor window.
+	r = singleRate{rate: singleMinRate, minRTT: 50}
+	if got := r.window(4096, singleKCPMTU); got != singleMinWindow {
+		t.Fatalf("window %d, want the floor %d", got, singleMinWindow)
+	}
+}
+
+func TestSingleRateCutsOnAbsoluteQueue(t *testing.T) {
+	// Even if the floor was itself measured high, a plainly high round trip
+	// is a standing queue and cuts the rate.
+	sec := int64(time.Second)
+	r := singleRate{rate: 1 << 20, minRTT: 1400, minAt: sec, changedAt: 0}
+	before := r.rate
+	r.judge(judged(1.0), 3*sec, 1, 1600) // 1600 ms > singleAbsQueue
+	if r.rate >= before {
+		t.Fatalf("rate %.0f did not cut on a %d ms round trip", r.rate, 1600)
+	}
+}
+
+func TestSingleRateCredit(t *testing.T) {
+	sec := int64(time.Second)
+	var r singleRate
+	r.start(0)
+	if got := r.allow(0); got != 0 {
+		t.Fatalf("credit %d before any time passed", got)
+	}
+	// Banked credit stops at the burst: a span at the rate, or two samples,
+	// whichever is larger.
+	burst := int(max(float64(singleStartRate)*singleBurst.Seconds(), 2*singleSampleSize))
+	if got := r.allow(10 * sec); got != burst {
+		t.Fatalf("credit %d after ten idle seconds, want the burst %d", got, burst)
+	}
+	r.wrote(1000)
+	if got := r.allow(10 * sec); got != burst-1000 {
+		t.Fatalf("credit %d after writing 1000 bytes, want %d", got, burst-1000)
+	}
+}
+
+func TestSingleLaneWritesOnePacketSamplesAtItsRate(t *testing.T) {
+	p, _ := singleTransport()
+	out := make(chan *packetBuffer, 64)
+	var pools [4]sync.Pool
+	for range 40 {
+		packet := acquirePacketBuffer(&pools, epochHdrLen+singleKCPMTU+wireCRCLen)
+		hdr := p.epochHeader()
+		copy(packet.data, hdr[:])
+		packet.queued = monoNow()
+		out <- packet
+	}
+	lane := dataLane{out: out, name: "test"}
+	var sizes []int
+	write := func(sample []byte) bool {
+		sizes = append(sizes, len(sample))
+		return true
+	}
+	now := monoNow()
+	if lane.sendSingles(p, now, write) {
+		t.Fatal("wrote before the rate had given any credit")
+	}
+	// A burst of credit writes some single-packet samples, each within the
+	// one-packet budget.
+	lane.rate.rate = 300 << 10
+	if !lane.sendSingles(p, now+int64(10*time.Millisecond), write) {
+		t.Fatal("wrote nothing with 10 ms of credit")
+	}
+	if len(sizes) < 1 {
+		t.Fatal("wrote nothing with credit to spare")
+	}
+	for _, n := range sizes {
+		if n > singleSampleSize {
+			t.Fatalf("a %d-byte sample, over the one-packet budget", n)
+		}
+	}
+	// However fast the lane may write, a tick writes at most its share.
+	// Keep the clock within the stale window so the queued pushes still count.
+	sizes = nil
+	lane.rate.rate = singleMaxRate
+	lane.sendSingles(p, now+int64(30*time.Millisecond), write)
+	if len(sizes) != singleSamplesPerTick {
+		t.Fatalf("wrote %d samples in one tick, want %d", len(sizes), singleSamplesPerTick)
+	}
+}
+
+func TestSingleLaneDropsStalePushesButNotAnswers(t *testing.T) {
+	now := monoNow()
+	var pools [4]sync.Pool
+	push := acquirePacketBuffer(&pools, epochHdrLen+kcpHeaderBytes+wireCRCLen)
+	push.data[epochHdrLen+kcpCmdOff] = 81 // IKCP_CMD_PUSH
+	push.queued = now - int64(2*singleStale)
+	ack := acquirePacketBuffer(&pools, epochHdrLen+kcpHeaderBytes+wireCRCLen)
+	ack.data[epochHdrLen+kcpCmdOff] = 82 // IKCP_CMD_ACK
+	ack.queued = now - int64(2*singleStale)
+	fresh := acquirePacketBuffer(&pools, epochHdrLen+kcpHeaderBytes+wireCRCLen)
+	fresh.data[epochHdrLen+kcpCmdOff] = 81
+	fresh.queued = now
+	out := make(chan *packetBuffer, 4)
+	out <- push
+	out <- ack
+	out <- fresh
+	lane := dataLane{out: out}
+	if got := lane.takeFreshSingle(now); got != ack {
+		t.Fatal("a stale push was not dropped, or a stale acknowledgement was")
+	}
+	if got := lane.takeFreshSingle(now); got != fresh {
+		t.Fatal("a fresh push was dropped")
+	}
+}
+
+// kcpHeaderBytes is kcp-go's segment header.
+const kcpHeaderBytes = 24
+
+func TestWriterPaceSlowsWhenIdleAndSpeedsUpWhenBusy(t *testing.T) {
+	p, _ := singleTransport()
+	ticker := time.NewTicker(singleTick)
+	defer ticker.Stop()
+	pace := writerPace{ticker: ticker, fast: true}
+	for range singleIdleTicks - 1 {
+		pace.note(p, false)
+	}
+	if !pace.fast {
+		t.Fatal("slowed down before the idle ticks ran out")
+	}
+	pace.note(p, false)
+	if pace.fast {
+		t.Fatal("still fast after the idle ticks")
+	}
+	pace.note(p, true)
+	if !pace.fast || pace.idle != 0 {
+		t.Fatal("did not speed up on data")
+	}
+	p.single = false
+	pace.fast = false
+	pace.note(p, true)
+	if pace.fast {
+		t.Fatal("a multi-packet transport's writer changed pace")
 	}
 }

@@ -369,11 +369,11 @@ func (p *streamTransport) peerSessionFor(epoch uint32) *peerSession {
 	// do not ingest them (issue #95 multi-client cross-talk).
 	hdr := buildEpochHeaderTo(p.bindingToken, p.localEpochValue(), epoch)
 
-	data, err := startKCPAcks(out, acks, func(payload []byte) {
+	data, err := startKCPWith(out, acks, func(payload []byte) {
 		if p.onPeerData != nil {
 			p.onPeerData(peerID, payload)
 		}
-	}, hdr, p.sendWindow)
+	}, hdr, p.sendWindow, p.kcpSegmentSize())
 	if err != nil {
 		logger.Warnf("vp8channel: startKCP for peer 0x%08x failed: %v", epoch, err)
 
@@ -397,6 +397,7 @@ func (p *streamTransport) peerSessionFor(epoch uint32) *peerSession {
 		acks:   acks,
 		conn:   func() *kcpConn { return data.conn },
 		window: func(segments int) { data.sess.SetWindowSize(segments, 0) },
+		srtt:   func() int32 { return data.sess.GetSRTT() },
 		name:   "peer " + peerID,
 	}, sess.done)
 
@@ -443,9 +444,9 @@ func (p *streamTransport) controlOf(sess *peerSession) *kcpRuntime {
 		epoch|controlEpochFlag,
 	)
 
-	control, err := startKCP(p.control.out, func(data []byte) {
+	control, err := startKCPWith(p.control.out, nil, func(data []byte) {
 		p.deliverPeerControlData(peerID, data)
-	}, hdr, p.sendWindow)
+	}, hdr, p.sendWindow, p.kcpSegmentSize())
 	if err != nil {
 		logger.Warnf("vp8channel: startKCP for peer control 0x%08x failed: %v", epoch, err)
 

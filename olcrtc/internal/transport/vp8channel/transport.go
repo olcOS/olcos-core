@@ -145,6 +145,12 @@ type streamTransport struct {
 	// bulk data from per-peer pumps while writerLoop writes control frames
 	// and keepalives, so both paths must funnel through this lock.
 	writeMu sync.Mutex
+	// single says the engine's relay wants single-packet frames (writer.go);
+	// keyframes is when such a transport writes its keyframes, and
+	// lastSampleAt when it wrote its last sample (under writeMu).
+	single       bool
+	keyframes    keyframeSchedule
+	lastSampleAt time.Time
 	// sampleWriter, when set, replaces the real track.WriteSample call.
 	// Tests inject a writer here to observe the exact byte stream that
 	// reaches the track and to assert that writeSampleLocked serializes
@@ -280,6 +286,11 @@ func New(ctx context.Context, cfg transport.Config) (transport.Transport, error)
 	if ride.answersKeyframeRequests() {
 		stream.SetKeyframeRequestHandler(tr.requestKeyframe)
 	}
+	// A single-packet relay (Telemost) writes its keyframes on a schedule of
+	// its own; the relay's requests feed that schedule instead.
+	if tr.single {
+		stream.SetKeyframeRequestHandler(tr.keyframes.request)
+	}
 
 	if err := stream.AddTrack(track); err != nil {
 		return nil, fmt.Errorf("attach local video track: %w", err)
@@ -300,6 +311,7 @@ func newStreamTransport(
 	// transport and one that does not leaves it alone.
 	limiter := common.NewPublishLimiter(common.PublishRateLimit(stream), publishBurstBytes)
 	tr := &streamTransport{
+		single:           common.SinglePacketRelay(stream),
 		Lifecycle:        common.NewLifecycle(stream),
 		stream:           stream,
 		track:            track,
@@ -328,6 +340,7 @@ func newStreamTransport(
 	tr.control = newKCPPlane(controlOutboundQueueSize, tr.deliverControlData)
 	// ai-generated: both planes run with this transport's window (olcrtc#26).
 	tr.data.sndWnd, tr.control.sndWnd = tr.sendWindow, tr.sendWindow
+	tr.data.mtu, tr.control.mtu = tr.kcpSegmentSize(), tr.kcpSegmentSize()
 
 	tr.shaper = transport.NewShaper(cfg.Traffic, tr.Features())
 
@@ -347,6 +360,10 @@ func (p *streamTransport) Connect(ctx context.Context) error {
 	// Connect. Without this the handshake round-trip that runs right after
 	// would deadlock: muxconn.Write spins on CanSend (which checks for a live
 	// KCP) while KCP only started on the first incoming peer frame.
+	if p.single {
+		logger.Infof("vp8channel: single-packet frames, keyframes only on start, request and every %s",
+			singleKeyframePeriod)
+	}
 	switch started, err := p.data.start(p.epochHeader()); {
 	case err != nil:
 		logger.Infof("vp8channel: startKCP failed: %v", err)
@@ -500,6 +517,9 @@ func (p *streamTransport) restartPlanes() {
 	p.data.restart(p.rotateEpochHeader())
 	p.control.restart(p.controlEpochHeader())
 	p.readdressPeers()
+	if p.single {
+		p.keyframes.restart()
+	}
 }
 
 // PeerSeen implements transport.PeerObserver: a frame with our binding token
