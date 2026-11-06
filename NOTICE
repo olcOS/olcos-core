@@ -1,0 +1,24 @@
+olcos-core
+Copyright (c) 2026 Hotelk52339 and the olcOS contributors
+
+The olcOS code in this repository is under the MIT License (LICENSE).
+
+This repository includes:
+
+olcRTC (olcrtc/)
+  https://github.com/ghostlane-project/olcrtc
+  Apache License 2.0, see olcrtc/LICENSE and olcrtc/NOTICE.
+  Derived from https://github.com/openlibrecommunity/olcrtc (WTFPL 2,
+  olcrtc/docs/upstream-license-wtfpl.txt).
+  olcOS modified some of its files; each one starts with a
+  "Changed by olcOS" line, and docs/olcrtc.md lists the changes.
+
+Go modules linked into the apps' framework include, among others:
+
+  github.com/xtls/xray-core          Mozilla Public License 2.0
+  github.com/pion/*                  MIT License
+  github.com/Jigsaw-Code/outline-sdk Apache License 2.0
+  golang.org/x/mobile, golang.org/x/* BSD 3-Clause License
+
+The complete dependency list is in go.mod, mobile/go.mod and olcrtc/go.mod;
+the apps ship the full license texts in their third-party notices.

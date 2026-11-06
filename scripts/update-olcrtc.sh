@@ -6,7 +6,7 @@
 # `git subtree pull --squash` merges the new release under the olcOS commits;
 # if it stops on a conflict, resolve it, commit, and run this script again
 # with --continue to finish the pin and the patch. The apps pin the same
-# commit (AppConstants.upstreamCorePin on iOS, the matching constant on
+# commit (AppConstants.upstreamCorePin on iOS, Maintenance.CORE_PIN on
 # Android): update them in the same release.
 set -euo pipefail
 
