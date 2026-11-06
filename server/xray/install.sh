@@ -27,12 +27,14 @@
 #   OLCOS_XRAY_TARGET    REALITY target host[:443]; empty = first passing candidate
 #   OLCOS_XRAY_TARGETS   comma-separated candidates for that (default below)
 #   OLCOS_XRAY_SNI       SNI list, comma separated (default: target host)
-#   OLCOS_XRAY_TAG       image tag (default 26.3.27 = current non-pre-release)
+#   OLCOS_XRAY_TAG       image tag (default 26.10.31: the current release, the
+#                        first with MPTCP off by default, Xray-core #7291)
 #   OLCOS_XRAY_NAME      client name (default olcOS)
 #   OLCOS_XRAY_HOST      address written into the link (default: public IPv4)
 #   OLCOS_XRAY_ADOPT     0 = install a new deployment even if one exists (default 1)
 #   OLCOS_XRAY_PREFIX    parent directory of the deployment (default /opt)
 #   OLCOS_XRAY_BBR       1 to enable BBR + fq via sysctl (default 0)
+#   OLCOS_KEEP_MPTCP     1 to leave net.mptcp.enabled as it is (default: set to 0)
 #   OLCOS_XRAY_ALLOW_NOSNI  1 to also accept clients that send no SNI (adds ""
 #                        to serverNames; the target must itself answer without
 #                        SNI, which the probe below verifies)
@@ -43,7 +45,7 @@
 set -euo pipefail
 
 IMAGE_BASE="ghcr.io/xtls/xray-core"
-TAG="${OLCOS_XRAY_TAG:-26.3.27}"
+TAG="${OLCOS_XRAY_TAG:-26.10.31}"
 IMAGE="${IMAGE_BASE}:${TAG}"
 ID="${OLCOS_XRAY_ID:-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n' | cut -c1-8)}"
 PORT="${OLCOS_XRAY_PORT:-443}"
@@ -147,7 +149,7 @@ podman pull -q "${IMAGE}" >/dev/null || die "could not pull ${IMAGE}"
 xray() { podman run --rm "${IMAGE}" "$@"; }
 
 # --- REALITY target ------------------------------------------------------------------
-# Output format of `xray tls ping` (26.3.27):
+# Output format of `xray tls ping` (26.3.27 to 26.10.31):
 #   Using IP:  1.2.3.4:443
 #   Pinging without SNI / Handshake succeeded|Handshake failure: ...
 #   TLS Version: ... TLS 1.3
@@ -282,6 +284,20 @@ chmod 750 "${CONF}"; chmod 640 "${CONF}"/*.json
 # stdout carries only the KEY=VALUE result lines, so the check reports to stderr.
 podman run --rm -v "${CONF}:/usr/local/etc/xray:ro,Z" "${IMAGE}" run -test -confdir /usr/local/etc/xray/ >&2 \
   || die "xray rejected the generated config"
+
+# The published root exploit for CVE-2026-98432 (a use-after-free in the
+# kernel's IPv4 TCP connection setup) goes through an MPTCP listener, and Go
+# 1.24+ listens with MPTCP by default (the reason for Xray-core #7291). Nothing
+# olcOS runs needs MPTCP, so turn it off for the host unless OLCOS_KEEP_MPTCP=1.
+# The bug itself is not MPTCP-specific: a patched kernel is the real fix.
+if [[ "${OLCOS_KEEP_MPTCP:-0}" != "1" ]] && [[ "$(sysctl -n net.mptcp.enabled 2>/dev/null || echo 0)" == "1" ]]; then
+  if { printf 'net.mptcp.enabled=0\n' > /etc/sysctl.d/99-olcos-mptcp.conf; } 2>/dev/null &&
+    sysctl -q -p /etc/sysctl.d/99-olcos-mptcp.conf >/dev/null 2>&1; then
+    log "MPTCP is off for this host now (net.mptcp.enabled=0)"
+  else
+    log "could not turn MPTCP off (non-fatal)"
+  fi
+fi
 
 if [[ "${OLCOS_XRAY_BBR:-0}" == "1" ]]; then
   printf 'net.core.default_qdisc=fq\nnet.ipv4.tcp_congestion_control=bbr\n' > /etc/sysctl.d/99-olcos-bbr.conf
