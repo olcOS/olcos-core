@@ -118,6 +118,9 @@ func (Engine) Start(ctx context.Context, p engine.Profile, h engine.Host) (engin
 			}
 		}
 		opts.SocksPort = port
+		if ah, ok := h.(engine.SocksAuthHinter); ok {
+			opts.SocksUser, opts.SocksPass = ah.SocksAuth()
+		}
 	}
 	raw, err := RenderClientConfig(p, opts)
 	if err != nil {

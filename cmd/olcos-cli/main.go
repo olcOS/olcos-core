@@ -28,6 +28,8 @@ func main() {
 	uri := flag.String("uri", os.Getenv("OLCOS_URI"), "share link (vless:// or olcrtc://); default $OLCOS_URI")
 	duration := flag.Duration("duration", 0, "stop after this long (0 = until signal)")
 	every := flag.Duration("stats", 5*time.Second, "stats print interval (0 = off)")
+	socksUser := flag.String("socks-user", "", "SOCKS5 username the local listener requires (with -socks-pass)")
+	socksPass := flag.String("socks-pass", "", "SOCKS5 password the local listener requires")
 	flag.Parse()
 	if *uri == "" {
 		fmt.Fprintln(os.Stderr, "usage: olcos-cli -uri vless://... [-duration 30s]")
@@ -36,7 +38,7 @@ func main() {
 
 	rt := olcos.New()
 	rt.SetLogWriter(stderrLog{})
-	in, _ := json.Marshal(map[string]string{"uri": *uri})
+	in, _ := json.Marshal(map[string]string{"uri": *uri, "socks_user": *socksUser, "socks_pass": *socksPass})
 	out := rt.Invoke("engine.start", string(in))
 	var env struct {
 		OK     bool            `json:"ok"`

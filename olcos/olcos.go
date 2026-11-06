@@ -46,6 +46,8 @@ type Runtime struct {
 	log       LogWriter
 	tun       int
 	socksPort int
+	socksUser string
+	socksPass string
 	sess      engine.Session
 	starting  bool
 	// stopPending records a Stop that arrived while an engine was booting;
@@ -82,6 +84,15 @@ func (r *Runtime) SetSocksPort(port int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.socksPort = port
+}
+
+// SetSocksAuth sets the username and password the SOCKS5 listener of the next
+// engine.start requires; empty strings leave it open to any local client.
+// Also reachable through the "socks_user"/"socks_pass" fields of engine.start.
+func (r *Runtime) SetSocksAuth(user, pass string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.socksUser, r.socksPass = user, pass
 }
 
 // start boots the engine selected by p.Kind. Only one session may run at a
@@ -174,6 +185,11 @@ func (h *host) SocksPort() int {
 	defer h.rt.mu.Unlock()
 	return h.rt.socksPort
 }
+func (h *host) SocksAuth() (string, string) {
+	h.rt.mu.Lock()
+	defer h.rt.mu.Unlock()
+	return h.rt.socksUser, h.rt.socksPass
+}
 func (h *host) Notify(kind, payload string) {
 	h.rt.emit(2, kind+":"+payload)
 }
@@ -224,9 +240,10 @@ func reply(v any, err error) string {
 //	profile.parse          in {"link":"vless://…|olcrtc://…"}      -> Profile
 //	profile.export         in Profile                              -> {"link":…}
 //	profile.parse_subscription in {"body":…}                       -> {"profiles":[…],"errors":[…]}
-//	xray.render_client     in {"profile":Profile,"socks_port":n,"tun_fd":n,"log_level":…} -> {"config":…}
+//	xray.render_client     in {"profile":Profile,"socks_port":n,"socks_user":…,"socks_pass":…,"tun_fd":n,"log_level":…} -> {"config":…}
 //	xray.render_server     in xray.ServerOptions (snake_case keys) -> {"config":…}
-//	engine.start           in {"profile":Profile} or {"uri":"vless://…"} [+ "socks_port":n] -> {"socks_addr":…,"owns_tun":bool}
+//	engine.start           in {"profile":Profile} or {"uri":"vless://…"} [+ "socks_port":n, "socks_user":…, "socks_pass":…] -> {"socks_addr":…,"owns_tun":bool}
+//	                          with socks_user and socks_pass the SOCKS5 listener requires them (RFC 1929).
 //	engine.stop                                                     -> {}
 //	engine.stats                                                    -> engine.Stats
 //	engine.probe           in {"profile":Profile} or {"uri":…} [+ "timeout_ms":n] -> {"rtt_ms":n}
@@ -280,13 +297,15 @@ func (r *Runtime) Invoke(method string, jsonIn string) (out string) {
 		var in struct {
 			Profile   engine.Profile `json:"profile"`
 			SocksPort int            `json:"socks_port"`
+			SocksUser string         `json:"socks_user"`
+			SocksPass string         `json:"socks_pass"`
 			TunFD     *int           `json:"tun_fd"`
 			LogLevel  string         `json:"log_level"`
 		}
 		if err := json.Unmarshal([]byte(jsonIn), &in); err != nil {
 			return reply(nil, err)
 		}
-		opts := xraycfg.ClientOptions{SocksPort: in.SocksPort, TunFD: -1, LogLevel: in.LogLevel}
+		opts := xraycfg.ClientOptions{SocksPort: in.SocksPort, SocksUser: in.SocksUser, SocksPass: in.SocksPass, TunFD: -1, LogLevel: in.LogLevel}
 		if in.TunFD != nil {
 			opts.TunFD = *in.TunFD
 		}
@@ -320,6 +339,10 @@ func (r *Runtime) Invoke(method string, jsonIn string) (out string) {
 			Profile   *engine.Profile `json:"profile"`
 			URI       string          `json:"uri"`
 			SocksPort int             `json:"socks_port"`
+			// SocksUser and SocksPass, both set, make the SOCKS5 listener
+			// require them; each start sets them anew (empty = open).
+			SocksUser string `json:"socks_user"`
+			SocksPass string `json:"socks_pass"`
 			// Direct lists the destinations reached directly, never through
 			// the server (xraycfg.ParamDirect).
 			Direct string `json:"direct"`
@@ -340,6 +363,7 @@ func (r *Runtime) Invoke(method string, jsonIn string) (out string) {
 		if in.SocksPort > 0 {
 			r.SetSocksPort(in.SocksPort)
 		}
+		r.SetSocksAuth(in.SocksUser, in.SocksPass)
 		sess, err := r.start(p)
 		if err != nil {
 			return reply(nil, err)

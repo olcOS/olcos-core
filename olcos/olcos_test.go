@@ -202,3 +202,17 @@ func TestEngineStartRespectsSocksPort(t *testing.T) {
 		t.Fatalf("host hint = %d", h.SocksPort())
 	}
 }
+
+func TestEngineStartSetsSocksAuthEachTime(t *testing.T) {
+	rt := New()
+	h := &host{rt: rt}
+	in := `{"profile":{"kind":"bogus","secret":"x"},"socks_port":18080,"socks_user":"u","socks_pass":"p"}`
+	_ = rt.Invoke("engine.start", in)
+	if u, p := h.SocksAuth(); u != "u" || p != "p" {
+		t.Fatalf("socks auth not recorded: %q %q", u, p)
+	}
+	_ = rt.Invoke("engine.start", `{"profile":{"kind":"bogus","secret":"x"}}`)
+	if u, p := h.SocksAuth(); u != "" || p != "" {
+		t.Fatalf("a start without credentials kept the earlier ones: %q %q", u, p)
+	}
+}

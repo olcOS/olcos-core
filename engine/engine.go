@@ -80,6 +80,13 @@ type SocksPortHinter interface {
 	SocksPort() int
 }
 
+// SocksAuthHinter is an optional Host extension: credentials the engine's
+// SOCKS5 listener must require (username/password, RFC 1929). Empty strings
+// keep the listener open to any local client. Engines must type-assert.
+type SocksAuthHinter interface {
+	SocksAuth() (user, pass string)
+}
+
 // Stats is the snapshot reported to the UI hero picture. The picture follows
 // MEASURED throughput and prints no numbers; keep the fields raw.
 type Stats struct {

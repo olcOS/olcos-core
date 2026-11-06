@@ -51,6 +51,10 @@ type ClientOptions struct {
 	// SocksPort > 0 renders a 127.0.0.1 SOCKS5 inbound that the platform's
 	// tun2socks stack feeds (variant B in docs/architecture.md).
 	SocksPort int
+	// SocksUser and SocksPass, both set, make that SOCKS5 inbound require
+	// username/password authentication (RFC 1929): another app on the phone
+	// cannot use the loopback listener, or find the tunnel through it.
+	SocksUser, SocksPass string
 	// TunFD >= 0 renders the native tun inbound instead (variant A). Mutually
 	// exclusive with SocksPort. The fd itself is passed via XRAY_TUN_FD.
 	TunFD int
@@ -95,6 +99,12 @@ func RenderClientConfig(p engine.Profile, o ClientOptions) ([]byte, error) {
 	if (o.SocksPort > 0) == (o.TunFD >= 0) {
 		return nil, errors.New("xray: set exactly one of SocksPort or TunFD")
 	}
+	if (o.SocksUser == "") != (o.SocksPass == "") {
+		return nil, errors.New("xray: set both SOCKS username and password, or neither")
+	}
+	if len(o.SocksUser) > 255 || len(o.SocksPass) > 255 {
+		return nil, errors.New("xray: SOCKS username and password are 255 bytes at most")
+	}
 	get := func(k, def string) string {
 		if v := p.Params[k]; v != "" {
 			return v
@@ -108,10 +118,15 @@ func RenderClientConfig(p engine.Profile, o ClientOptions) ([]byte, error) {
 
 	var inbound map[string]any
 	if o.SocksPort > 0 {
+		// UDP stays off: olcos-ios tunstack forwards TCP CONNECT only.
+		settings := map[string]any{"udp": false}
+		if o.SocksUser != "" {
+			settings["auth"] = "password"
+			settings["accounts"] = []any{map[string]any{"user": o.SocksUser, "pass": o.SocksPass}}
+		}
 		inbound = map[string]any{
 			"tag": "socks-in", "listen": "127.0.0.1", "port": o.SocksPort, "protocol": "socks",
-			// UDP stays off: olcos-ios tunstack forwards TCP CONNECT only.
-			"settings": map[string]any{"udp": false},
+			"settings": settings,
 		}
 	} else {
 		inbound = map[string]any{

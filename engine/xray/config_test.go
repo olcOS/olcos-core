@@ -193,6 +193,37 @@ func TestServerScriptBlocksTheSamePrivateNets(t *testing.T) {
 	}
 }
 
+func TestRenderClientSocksAuth(t *testing.T) {
+	out, err := RenderClientConfig(sample(), ClientOptions{SocksPort: 1080, TunFD: -1, SocksUser: "u", SocksPass: "p"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg struct {
+		Inbounds []struct {
+			Settings struct {
+				Auth     string `json:"auth"`
+				Accounts []struct {
+					User string `json:"user"`
+					Pass string `json:"pass"`
+				} `json:"accounts"`
+			} `json:"settings"`
+		} `json:"inbounds"`
+	}
+	if err := json.Unmarshal(out, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	set := cfg.Inbounds[0].Settings
+	if set.Auth != "password" || len(set.Accounts) != 1 || set.Accounts[0].User != "u" || set.Accounts[0].Pass != "p" {
+		t.Fatalf("socks settings %+v", set)
+	}
+	if _, err := RenderClientConfig(sample(), ClientOptions{SocksPort: 1080, TunFD: -1, SocksUser: "u"}); err == nil {
+		t.Fatal("a username without a password was accepted")
+	}
+	if _, err := RenderClientConfig(sample(), ClientOptions{SocksPort: 1080, TunFD: -1, SocksUser: strings.Repeat("u", 256), SocksPass: "p"}); err == nil {
+		t.Fatal("a 256-byte username was accepted")
+	}
+}
+
 func TestConfigsKeepNoAccessLog(t *testing.T) {
 	client, err := RenderClientConfig(sample(), ClientOptions{SocksPort: 1080, TunFD: -1})
 	if err != nil {

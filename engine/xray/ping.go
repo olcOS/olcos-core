@@ -3,6 +3,7 @@ package xray
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
@@ -50,7 +51,10 @@ func Ping(ctx context.Context, p engine.Profile, targetURL string) (int64, error
 	}
 	// loglevel none: this instance must not feed the running session's log
 	// sink, where its failures would read as health events of that session.
-	raw, err := RenderClientConfig(p, ClientOptions{SocksPort: port, TunFD: -1, LogLevel: "none"})
+	// Throwaway credentials: no other local client may use this listener
+	// while it lives.
+	user, pass := rand.Text(), rand.Text()
+	raw, err := RenderClientConfig(p, ClientOptions{SocksPort: port, TunFD: -1, LogLevel: "none", SocksUser: user, SocksPass: pass})
 	if err != nil {
 		return 0, err
 	}
@@ -69,7 +73,7 @@ func Ping(ctx context.Context, p engine.Profile, targetURL string) (int64, error
 	defer inst.Close()
 
 	transport := &http.Transport{
-		Proxy:                 http.ProxyURL(&url.URL{Scheme: "socks5", Host: net.JoinHostPort("127.0.0.1", strconv.Itoa(port))}),
+		Proxy:                 http.ProxyURL(&url.URL{Scheme: "socks5", User: url.UserPassword(user, pass), Host: net.JoinHostPort("127.0.0.1", strconv.Itoa(port))}),
 		MaxIdleConnsPerHost:   4,
 		IdleConnTimeout:       10 * time.Second,
 		TLSHandshakeTimeout:   pingSampleTimeout,

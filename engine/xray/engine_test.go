@@ -2,6 +2,7 @@ package xray
 
 import (
 	"context"
+	"io"
 	"net"
 	"strings"
 	"sync"
@@ -130,5 +131,65 @@ func TestStartRejectsInvalidProfile(t *testing.T) {
 	delete(p.Params, ParamPublicKey)
 	if _, err := (Engine{}).Start(context.Background(), p, &testHost{tun: -1}); err == nil {
 		t.Fatal("expected validation error without pbk")
+	}
+}
+
+type authHost struct {
+	testHost
+	user, pass string
+}
+
+func (h *authHost) SocksAuth() (string, string) { return h.user, h.pass }
+
+// socksGreet runs the SOCKS5 method negotiation (and, for method 2, the
+// RFC 1929 exchange) and returns the method the listener chose and, when it
+// chose username/password, the status of that exchange.
+func socksGreet(t *testing.T, addr string, method byte, user, pass string) (chosen, status byte) {
+	t.Helper()
+	c, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(3 * time.Second))
+	if _, err := c.Write([]byte{5, 1, method}); err != nil {
+		t.Fatalf("greeting: %v", err)
+	}
+	reply := make([]byte, 2)
+	if _, err := io.ReadFull(c, reply); err != nil {
+		t.Fatalf("method reply: %v", err)
+	}
+	if reply[1] != 2 {
+		return reply[1], 0xff
+	}
+	msg := append([]byte{1, byte(len(user))}, user...)
+	msg = append(append(msg, byte(len(pass))), pass...)
+	if _, err := c.Write(msg); err != nil {
+		t.Fatalf("auth: %v", err)
+	}
+	if _, err := io.ReadFull(c, reply); err != nil {
+		return 2, 0xff // a refused login may just close the connection
+	}
+	return 2, reply[1]
+}
+
+// TestSocksListenerRequiresTheHostsCredentials: with SocksAuth from the host,
+// another local client cannot use the listener without the password.
+func TestSocksListenerRequiresTheHostsCredentials(t *testing.T) {
+	h := &authHost{testHost: testHost{tun: -1}, user: "olcos", pass: "s3cret-for-this-session"}
+	sess, err := Engine{}.Start(context.Background(), testProfile(), h)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer sess.Close()
+	addr := sess.SocksAddr()
+	if chosen, _ := socksGreet(t, addr, 0, "", ""); chosen != 0xff {
+		t.Fatalf("no-auth greeting: method %d accepted", chosen)
+	}
+	if _, status := socksGreet(t, addr, 2, "olcos", "wrong"); status == 0 {
+		t.Fatal("a wrong password was accepted")
+	}
+	if chosen, status := socksGreet(t, addr, 2, "olcos", "s3cret-for-this-session"); chosen != 2 || status != 0 {
+		t.Fatalf("the right password: method %d, status %d", chosen, status)
 	}
 }
