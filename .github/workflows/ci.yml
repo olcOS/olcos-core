@@ -1,34 +1,167 @@
-name: ci
+name: olcos-core
 
 on:
   push:
-    branches: ["**"]
+    branches: [main]
+    tags: ['v*']
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   go:
+    name: Go (core, mobile, olcrtc)
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v5
         with:
-          go-version-file: go.mod
-      - name: gofmt
-        run: test -z "$(gofmt -l .)"
-      - name: go vet
-        run: go vet ./...
-      - name: go test
-        run: go test ./...
-  shell:
+          persist-credentials: false
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: mobile/go.mod
+          cache-dependency-path: |
+            go.sum
+            mobile/go.sum
+            olcrtc/go.sum
+
+      - name: Formatting
+        run: |
+          unformatted="$(gofmt -l . )"
+          if [ -n "$unformatted" ]; then echo "gofmt needed:"; echo "$unformatted"; exit 1; fi
+
+      - name: Core module
+        run: |
+          go vet ./...
+          go test -count=1 ./...
+
+      - name: Mobile module
+        working-directory: mobile
+        run: |
+          go mod tidy -diff
+          go vet ./...
+          go test -count=1 ./...
+
+      # The whole of olcrtc is built and vetted; tests run for the packages
+      # the olcOS commits touch (upstream's CI covers the rest, and a few of
+      # its timing tests are flaky on small runners).
+      - name: olcrtc
+        working-directory: olcrtc
+        run: |
+          go build ./...
+          go vet ./...
+          go test -count=1 ./internal/engine/ ./internal/engine/goolom/... ./internal/transport/... ./internal/protect/... ./mobile/...
+
+      # The apps upload the agent and bond sources and the servers build them
+      # offline with a one-line go.mod: both must stay standard-library only.
+      - name: Agent and bond build like on a server
+        run: |
+          for pkg in agent bond; do
+            dir="$RUNNER_TEMP/server-$pkg"
+            mkdir -p "$dir/src/$pkg/cmd"
+            printf 'module github.com/openlibrecommunity/olcrtc-ios/gomobile\n\ngo 1.22\n' > "$dir/src/go.mod"
+            find "mobile/$pkg" -maxdepth 1 -name '*.go' ! -name '*_test.go' -exec cp {} "$dir/src/$pkg/" \;
+            cp -r "mobile/$pkg/cmd/." "$dir/src/$pkg/cmd/"
+            (cd "$dir/src" && GOPROXY=off GOFLAGS=-mod=mod CGO_ENABLED=0 go build -trimpath -o "$dir/olcos-$pkg" "./$pkg/cmd/olcos-$pkg")
+            echo "$pkg: $(du -h "$dir/olcos-$pkg" | cut -f1)"
+          done
+
+  scripts:
+    name: Server scripts and the olcrtc patch
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - name: bash -n
-        run: bash -n server/xray/*.sh
+      - uses: actions/checkout@v5
+        with:
+          # make-core-patch.sh reads the subtree history.
+          fetch-depth: 0
+          persist-credentials: false
+
       - name: shellcheck
         run: |
-          sudo apt-get update -q && sudo apt-get install -y -q shellcheck
-          shellcheck server/xray/*.sh
+          shellcheck -S warning scripts/*.sh server/*.sh server/xray/*.sh
+          shellcheck -S warning -s bash server/agent-status/*.sh
+
+      - name: srv.sh follows olcrtc/install.sh
+        run: |
+          python3 scripts/parity_check.py --selftest
+          python3 scripts/parity_check.py
+
+      - name: The server patch matches olcrtc/
+        run: scripts/make-core-patch.sh --check
+
+      - name: Offline script tests
+        run: |
+          python3 scripts/test_server_scripts.py
+          python3 scripts/test_xray_server_script.py
+
+  bind-android:
+    name: gomobile bind (Android)
+    needs: go
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: mobile/go.mod
+          cache-dependency-path: |
+            go.sum
+            mobile/go.sum
+            olcrtc/go.sum
+
+      - name: Bind
+        run: |
+          export ANDROID_NDK_HOME="${ANDROID_NDK_LATEST_HOME:-}"
+          scripts/build-android.sh build/olcoscore.aar
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: olcoscore-aar
+          path: build/olcoscore.aar
+          retention-days: 7
+
+  bind-ios:
+    name: gomobile bind (iOS)
+    needs: go
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: mobile/go.mod
+          cache-dependency-path: |
+            go.sum
+            mobile/go.sum
+            olcrtc/go.sum
+
+      - name: Bind
+        run: scripts/build-ios.sh build/Mobile.xcframework
+
+      - name: Pack
+        run: cd build && ditto -c -k --keepParent Mobile.xcframework Mobile.xcframework.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mobile-xcframework
+          path: build/Mobile.xcframework.zip
+          retention-days: 7
