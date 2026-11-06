@@ -1,8 +1,14 @@
 diff --git a/internal/engine/engine.go b/internal/engine/engine.go
-index 51ae3cba..c00b13a7 100644
+index 51ae3cba..2af5bce9 100644
 --- a/internal/engine/engine.go
 +++ b/internal/engine/engine.go
-@@ -173,6 +173,17 @@ type KeyframeRequestSource interface {
+@@ -1,3 +1,5 @@
++// Changed by olcOS (https://github.com/olcOS/olcos-core): see docs/olcrtc.md there.
++
+ // Package engine defines the wire-level transport engine that connects to a
+ // remote SFU. An engine is independent of how the room credentials were
+ // obtained: it accepts a signaling URL and an access token, and exposes the
+@@ -173,6 +175,17 @@ type KeyframeRequestSource interface {
  	SetKeyframeRequestHandler(cb func())
  }
  
@@ -21,10 +27,16 @@ index 51ae3cba..c00b13a7 100644
  type VideoTrackCapable interface {
  	AddVideoTrack(track webrtc.TrackLocal) error
 diff --git a/internal/engine/goolom/session.go b/internal/engine/goolom/session.go
-index 4e34bbfc..5b832cde 100644
+index 4e34bbfc..9fdd1064 100644
 --- a/internal/engine/goolom/session.go
 +++ b/internal/engine/goolom/session.go
-@@ -18,6 +18,7 @@ import (
+@@ -1,3 +1,5 @@
++// Changed by olcOS (https://github.com/olcOS/olcos-core): see docs/olcrtc.md there.
++
+ // Package goolom implements an engine.Session backed by the Goolom SFU
+ // signaling protocol. Goolom is the proprietary SFU developed for Yandex
+ // Telemost; the on-wire protocol - capabilities offer, separated subscriber
+@@ -18,6 +20,7 @@ import (
  	"time"
  
  	"github.com/gorilla/websocket"
@@ -32,7 +44,7 @@ index 4e34bbfc..5b832cde 100644
  	"github.com/pion/webrtc/v4"
  
  	"github.com/openlibrecommunity/olcrtc/internal/engine"
-@@ -96,6 +97,9 @@ type TrafficShape struct {
+@@ -96,6 +99,9 @@ type TrafficShape struct {
  // Session is the Goolom engine handle.
  type Session struct {
  	dtlsProfile engine.DTLSProfile
@@ -42,7 +54,7 @@ index 4e34bbfc..5b832cde 100644
  	engine.Reconnector
  	engine.VideoTrackState
  
-@@ -436,12 +440,46 @@ func (s *Session) attachPendingVideoTracks(pub *webrtc.PeerConnection) error {
+@@ -436,12 +442,46 @@ func (s *Session) attachPendingVideoTracks(pub *webrtc.PeerConnection) error {
  	return attachErr
  }
  
@@ -60,7 +72,7 @@ index 4e34bbfc..5b832cde 100644
  	}
 -	go engine.DrainRTCP(sender)
 +	go s.readPublisherRTCP(sender)
- }
++}
 +
 +func (s *Session) readPublisherRTCP(sender *webrtc.RTPSender) {
 +	for {
@@ -70,7 +82,7 @@ index 4e34bbfc..5b832cde 100644
 +		}
 +		s.notePublisherRTCP(packets)
 +	}
-+}
+ }
 +
 +// notePublisherRTCP passes a keyframe request among packets on to the
 +// registered handler.
@@ -94,10 +106,15 @@ index 4e34bbfc..5b832cde 100644
 +// (engine.KeyframeRequestSource).
 +func (s *Session) SetKeyframeRequestHandler(cb func()) { s.keyframeRequest.Store(&cb) }
 diff --git a/internal/engine/goolom/session_helpers_test.go b/internal/engine/goolom/session_helpers_test.go
-index bb9ac361..3638a771 100644
+index bb9ac361..b19b9fde 100644
 --- a/internal/engine/goolom/session_helpers_test.go
 +++ b/internal/engine/goolom/session_helpers_test.go
-@@ -4,6 +4,8 @@ import (
+@@ -1,9 +1,13 @@
++// Changed by olcOS (https://github.com/olcOS/olcos-core): see docs/olcrtc.md there.
++
+ package goolom
+ 
+ import (
  	"testing"
  	"time"
  
@@ -106,7 +123,7 @@ index bb9ac361..3638a771 100644
  	"github.com/openlibrecommunity/olcrtc/internal/engine"
  )
  
-@@ -81,3 +83,30 @@ func TestWaitForAckTimeoutAndClose(t *testing.T) {
+@@ -81,3 +85,30 @@ func TestWaitForAckTimeoutAndClose(t *testing.T) {
  		t.Fatal("waitForAck(closeCh) = true")
  	}
  }
@@ -138,17 +155,23 @@ index bb9ac361..3638a771 100644
 +	}
 +}
 diff --git a/internal/transport/common/ratelimit_test.go b/internal/transport/common/ratelimit_test.go
-index db4cccdc..b23bd966 100644
+index db4cccdc..a1d8a49a 100644
 --- a/internal/transport/common/ratelimit_test.go
 +++ b/internal/transport/common/ratelimit_test.go
-@@ -171,3 +171,29 @@ func TestEngineVideoSessionForwardsThePublishRateLimit(t *testing.T) {
+@@ -1,3 +1,5 @@
++// Changed by olcOS (https://github.com/olcOS/olcos-core): see docs/olcrtc.md there.
++
+ package common
+ 
+ import (
+@@ -171,3 +173,29 @@ func TestEngineVideoSessionForwardsThePublishRateLimit(t *testing.T) {
  		t.Fatalf("EngineVideoSession.PublishRateLimit = %d, want 0", got)
  	}
  }
 +
 +type singlePacketSession struct{ notified func() }
 +
-+func (singlePacketSession) SinglePacketRelay() bool        { return true }
++func (singlePacketSession) SinglePacketRelay() bool                { return true }
 +func (s *singlePacketSession) SetKeyframeRequestHandler(cb func()) { s.notified = cb }
 +
 +func TestRelayCapabilitiesAreReadOffTheSession(t *testing.T) {
@@ -172,10 +195,16 @@ index db4cccdc..b23bd966 100644
 +	}
 +}
 diff --git a/internal/transport/common/session.go b/internal/transport/common/session.go
-index 194b1a23..bc73a45c 100644
+index 194b1a23..da83db78 100644
 --- a/internal/transport/common/session.go
 +++ b/internal/transport/common/session.go
-@@ -107,6 +107,18 @@ func OnKeyframeRequest(session any, cb func()) bool {
+@@ -1,3 +1,5 @@
++// Changed by olcOS (https://github.com/olcOS/olcos-core): see docs/olcrtc.md there.
++
+ package common
+ 
+ import (
+@@ -107,6 +109,18 @@ func OnKeyframeRequest(session any, cb func()) bool {
  	return true
  }
  
@@ -195,10 +224,16 @@ index 194b1a23..bc73a45c 100644
  func (v *EngineVideoSession) Connect(ctx context.Context) error {
  	if err := v.session.Connect(ctx); err != nil {
 diff --git a/internal/transport/vp8channel/kcp.go b/internal/transport/vp8channel/kcp.go
-index 56d5d651..bb4c5401 100644
+index 56d5d651..18ebf596 100644
 --- a/internal/transport/vp8channel/kcp.go
 +++ b/internal/transport/vp8channel/kcp.go
-@@ -148,6 +148,14 @@ func startKCP(
+@@ -1,3 +1,5 @@
++// Changed by olcOS (https://github.com/olcOS/olcos-core): see docs/olcrtc.md there.
++
+ package vp8channel
+ 
+ import (
+@@ -148,6 +150,14 @@ func startKCP(
  // ai-generated: the acks queue (issue #12).
  func startKCPAcks(
  	out, acks chan<- *packetBuffer, onData func([]byte), epochHdr [epochHdrLen]byte, sndWnd int,
@@ -213,7 +248,7 @@ index 56d5d651..bb4c5401 100644
  ) (*kcpRuntime, error) {
  	c := newKCPConn(out, inboundQueueSizeFor(), epochHdr)
  	c.acks = acks
-@@ -171,7 +179,10 @@ func startKCPAcks(
+@@ -171,7 +181,10 @@ func startKCPAcks(
  		sndWnd = kcpSendWindow(false)
  	}
  	sess.SetWindowSize(sndWnd, kcpRcvWindow())
@@ -225,7 +260,7 @@ index 56d5d651..bb4c5401 100644
  	// Upstream marked SetStreamMode deprecated without providing a replacement;
  	// stream framing is still required for our wire format.
  	sess.SetStreamMode(true) //nolint:staticcheck // SA1019: no replacement upstream.
-@@ -275,6 +286,8 @@ type kcpPlane struct {
+@@ -275,6 +288,8 @@ type kcpPlane struct {
  	// sndWnd is the KCP send window its sessions run with; 0 takes this
  	// host's profile. The transport sets it. ai-generated (olcrtc#26).
  	sndWnd int
@@ -234,7 +269,7 @@ index 56d5d651..bb4c5401 100644
  
  	// lifecycleMu serializes start/restart/close. Without it two concurrent
  	// restarts - a provider reconnect and an upper-layer ResetPeer fire
-@@ -335,7 +348,7 @@ func (p *kcpPlane) start(hdr [epochHdrLen]byte) (bool, error) {
+@@ -335,7 +350,7 @@ func (p *kcpPlane) start(hdr [epochHdrLen]byte) (bool, error) {
  			return
  		}
  		var rt *kcpRuntime
@@ -243,7 +278,7 @@ index 56d5d651..bb4c5401 100644
  		if err != nil {
  			return
  		}
-@@ -367,7 +380,7 @@ func (p *kcpPlane) restart(hdr [epochHdrLen]byte) {
+@@ -367,7 +382,7 @@ func (p *kcpPlane) restart(hdr [epochHdrLen]byte) {
  		old.close()
  	}
  
@@ -253,10 +288,16 @@ index 56d5d651..bb4c5401 100644
  		return
  	}
 diff --git a/internal/transport/vp8channel/lane.go b/internal/transport/vp8channel/lane.go
-index 88a2dfe3..65f4dbe9 100644
+index 88a2dfe3..beef33a3 100644
 --- a/internal/transport/vp8channel/lane.go
 +++ b/internal/transport/vp8channel/lane.go
-@@ -77,6 +77,9 @@ type dataLane struct {
+@@ -1,3 +1,5 @@
++// Changed by olcOS (https://github.com/olcOS/olcos-core): see docs/olcrtc.md there.
++
+ package vp8channel
+ 
+ // ai-generated: the whole file (issue #12: a data lane that goes quiet while
+@@ -77,6 +79,9 @@ type dataLane struct {
  	conn func() *kcpConn
  	// window sets the send window of the queue's KCP session, in segments.
  	window func(segments int)
@@ -266,7 +307,7 @@ index 88a2dfe3..65f4dbe9 100644
  	// name tells the lane apart in the log.
  	name string
  
-@@ -101,6 +104,10 @@ type dataLane struct {
+@@ -101,6 +106,10 @@ type dataLane struct {
  	// it keeps on a path that loses packets.
  	pace   pace
  	frames frameCap
@@ -277,7 +318,7 @@ index 88a2dfe3..65f4dbe9 100644
  	// heldBack says the last flush had a frame to write and did not, because
  	// the publisher's bucket or the lane's own cap held it: the writer loop
  	// reads it so that a held tick does not count as an idle one and turn
-@@ -116,12 +123,16 @@ func (l *dataLane) flush(p *streamTransport, write func([]byte) bool) bool {
+@@ -116,12 +125,16 @@ func (l *dataLane) flush(p *streamTransport, write func([]byte) bool) bool {
  	switch {
  	case l.watch(p, now):
  		l.seen.probe() // on the lane's cadence, see kcpConn.probe
@@ -294,7 +335,7 @@ index 88a2dfe3..65f4dbe9 100644
  	acked := l.sendAcks(p, write)
  	sent := l.send(p, now, write)
  	if l.seen != nil {
-@@ -178,6 +189,14 @@ func (l *dataLane) sendAcks(p *streamTransport, write func([]byte) bool) bool {
+@@ -178,6 +191,14 @@ func (l *dataLane) sendAcks(p *streamTransport, write func([]byte) bool) bool {
  	l.ackPending = pending
  	_ = write(sample)
  	l.ackBuf = sample[:0]
@@ -309,7 +350,7 @@ index 88a2dfe3..65f4dbe9 100644
  	return true
  }
  
-@@ -192,6 +211,7 @@ func (l *dataLane) watch(p *streamTransport, now int64) bool {
+@@ -192,6 +213,7 @@ func (l *dataLane) watch(p *streamTransport, now int64) bool {
  			l.seen.hold(0)
  		}
  		l.seen, l.pushSince, l.darkSince, l.pace, l.frames = conn, 0, 0, pace{}, frameCap{}
@@ -317,7 +358,7 @@ index 88a2dfe3..65f4dbe9 100644
  	}
  	if conn == nil {
  		return false
-@@ -206,7 +226,12 @@ func (l *dataLane) watch(p *streamTransport, now int64) bool {
+@@ -206,7 +228,12 @@ func (l *dataLane) watch(p *streamTransport, now int64) bool {
  		conn.hold(cmp.Or(p.probeEvery, defaultProbeEvery))
  		l.sift()
  		frames := ""
@@ -331,7 +372,7 @@ index 88a2dfe3..65f4dbe9 100644
  			l.resize(p)
  			frames = ", " + l.frameNote()
  		}
-@@ -228,7 +253,8 @@ func (l *dataLane) watch(p *streamTransport, now int64) bool {
+@@ -228,7 +255,8 @@ func (l *dataLane) watch(p *streamTransport, now int64) bool {
  func (l *dataLane) settle(p *streamTransport, now int64) {
  	held := time.Duration(now - l.darkSince)
  	after := ""
@@ -341,7 +382,7 @@ index 88a2dfe3..65f4dbe9 100644
  		l.resize(p)
  		after = fmt.Sprintf(", at most %d KiB/s from now", int(l.pace.rate)>>10)
  	}
-@@ -443,3 +469,111 @@ func answers(packet []byte) bool {
+@@ -443,3 +471,111 @@ func answers(packet []byte) bool {
  	cmd := packet[kcpCmdOff]
  	return cmd == kcp.IKCP_CMD_ACK || cmd == kcp.IKCP_CMD_WINS
  }
@@ -454,10 +495,15 @@ index 88a2dfe3..65f4dbe9 100644
 +	return nil
 +}
 diff --git a/internal/transport/vp8channel/lane_test.go b/internal/transport/vp8channel/lane_test.go
-index 111bdcfa..13b857c5 100644
+index 111bdcfa..834110b0 100644
 --- a/internal/transport/vp8channel/lane_test.go
 +++ b/internal/transport/vp8channel/lane_test.go
-@@ -4,6 +4,7 @@ package vp8channel
+@@ -1,9 +1,12 @@
++// Changed by olcOS (https://github.com/olcOS/olcos-core): see docs/olcrtc.md there.
++
+ package vp8channel
+ 
+ // ai-generated: the whole file (issue #12: the data lane against an SFU that
  // stops forwarding a stream over its budget).
  
  import (
@@ -465,7 +511,7 @@ index 111bdcfa..13b857c5 100644
  	"context"
  	"crypto/rand"
  	"encoding/binary"
-@@ -13,6 +14,7 @@ import (
+@@ -13,6 +16,7 @@ import (
  	"testing"
  	"time"
  
@@ -473,7 +519,7 @@ index 111bdcfa..13b857c5 100644
  	kcp "github.com/xtaci/kcp-go/v5"
  
  	"github.com/openlibrecommunity/olcrtc/internal/transport"
-@@ -459,3 +461,384 @@ func TestCappedLaneDropsStalePushesButNotAnswers(t *testing.T) {
+@@ -459,3 +463,384 @@ func TestCappedLaneDropsStalePushesButNotAnswers(t *testing.T) {
  		t.Fatal("takeFresh() dropped a stale push on an uncapped lane")
  	}
  }
@@ -859,10 +905,16 @@ index 111bdcfa..13b857c5 100644
 +	}
 +}
 diff --git a/internal/transport/vp8channel/pace.go b/internal/transport/vp8channel/pace.go
-index 33e92a16..df880b41 100644
+index 33e92a16..45a34063 100644
 --- a/internal/transport/vp8channel/pace.go
 +++ b/internal/transport/vp8channel/pace.go
-@@ -151,3 +151,161 @@ func (s *pace) allow(now int64) int {
+@@ -1,3 +1,5 @@
++// Changed by olcOS (https://github.com/olcOS/olcos-core): see docs/olcrtc.md there.
++
+ package vp8channel
+ 
+ // ai-generated: the whole file (issue #12: the cap a data lane keeps after it
+@@ -151,3 +153,161 @@ func (s *pace) allow(now int64) int {
  	s.creditAt = now
  	return int(max(s.credit, 0))
  }
@@ -1025,10 +1077,16 @@ index 33e92a16..df880b41 100644
 +	return min(max(int(r.rate*rtt.Seconds())/mtu, singleMinWindow), max(ceiling, singleMinWindow))
 +}
 diff --git a/internal/transport/vp8channel/peers.go b/internal/transport/vp8channel/peers.go
-index 1dc2de54..ad54b070 100644
+index 1dc2de54..6c3d5be0 100644
 --- a/internal/transport/vp8channel/peers.go
 +++ b/internal/transport/vp8channel/peers.go
-@@ -369,11 +369,11 @@ func (p *streamTransport) peerSessionFor(epoch uint32) *peerSession {
+@@ -1,3 +1,5 @@
++// Changed by olcOS (https://github.com/olcOS/olcos-core): see docs/olcrtc.md there.
++
+ package vp8channel
+ 
+ import (
+@@ -369,11 +371,11 @@ func (p *streamTransport) peerSessionFor(epoch uint32) *peerSession {
  	// do not ingest them (issue #95 multi-client cross-talk).
  	hdr := buildEpochHeaderTo(p.bindingToken, p.localEpochValue(), epoch)
  
@@ -1042,7 +1100,7 @@ index 1dc2de54..ad54b070 100644
  	if err != nil {
  		logger.Warnf("vp8channel: startKCP for peer 0x%08x failed: %v", epoch, err)
  
-@@ -397,6 +397,7 @@ func (p *streamTransport) peerSessionFor(epoch uint32) *peerSession {
+@@ -397,6 +399,7 @@ func (p *streamTransport) peerSessionFor(epoch uint32) *peerSession {
  		acks:   acks,
  		conn:   func() *kcpConn { return data.conn },
  		window: func(segments int) { data.sess.SetWindowSize(segments, 0) },
@@ -1050,7 +1108,7 @@ index 1dc2de54..ad54b070 100644
  		name:   "peer " + peerID,
  	}, sess.done)
  
-@@ -443,9 +444,9 @@ func (p *streamTransport) controlOf(sess *peerSession) *kcpRuntime {
+@@ -443,9 +446,9 @@ func (p *streamTransport) controlOf(sess *peerSession) *kcpRuntime {
  		epoch|controlEpochFlag,
  	)
  
@@ -1063,10 +1121,16 @@ index 1dc2de54..ad54b070 100644
  		logger.Warnf("vp8channel: startKCP for peer control 0x%08x failed: %v", epoch, err)
  
 diff --git a/internal/transport/vp8channel/transport.go b/internal/transport/vp8channel/transport.go
-index ab5d3b9e..c9fe0a5a 100644
+index ab5d3b9e..33c465e0 100644
 --- a/internal/transport/vp8channel/transport.go
 +++ b/internal/transport/vp8channel/transport.go
-@@ -145,6 +145,12 @@ type streamTransport struct {
+@@ -1,3 +1,5 @@
++// Changed by olcOS (https://github.com/olcOS/olcos-core): see docs/olcrtc.md there.
++
+ // Package vp8channel disguises a KCP-based byte transport as a stream of
+ // valid VP8 keyframes so SFUs that validate bitstream conformance let the
+ // payload through. The package owns its own KCP framing; the per-message
+@@ -145,6 +147,12 @@ type streamTransport struct {
  	// bulk data from per-peer pumps while writerLoop writes control frames
  	// and keepalives, so both paths must funnel through this lock.
  	writeMu sync.Mutex
@@ -1079,7 +1143,7 @@ index ab5d3b9e..c9fe0a5a 100644
  	// sampleWriter, when set, replaces the real track.WriteSample call.
  	// Tests inject a writer here to observe the exact byte stream that
  	// reaches the track and to assert that writeSampleLocked serializes
-@@ -280,6 +286,11 @@ func New(ctx context.Context, cfg transport.Config) (transport.Transport, error)
+@@ -280,6 +288,11 @@ func New(ctx context.Context, cfg transport.Config) (transport.Transport, error)
  	if ride.answersKeyframeRequests() {
  		stream.SetKeyframeRequestHandler(tr.requestKeyframe)
  	}
@@ -1091,7 +1155,7 @@ index ab5d3b9e..c9fe0a5a 100644
  
  	if err := stream.AddTrack(track); err != nil {
  		return nil, fmt.Errorf("attach local video track: %w", err)
-@@ -300,6 +311,7 @@ func newStreamTransport(
+@@ -300,6 +313,7 @@ func newStreamTransport(
  	// transport and one that does not leaves it alone.
  	limiter := common.NewPublishLimiter(common.PublishRateLimit(stream), publishBurstBytes)
  	tr := &streamTransport{
@@ -1099,7 +1163,7 @@ index ab5d3b9e..c9fe0a5a 100644
  		Lifecycle:        common.NewLifecycle(stream),
  		stream:           stream,
  		track:            track,
-@@ -328,6 +340,7 @@ func newStreamTransport(
+@@ -328,6 +342,7 @@ func newStreamTransport(
  	tr.control = newKCPPlane(controlOutboundQueueSize, tr.deliverControlData)
  	// ai-generated: both planes run with this transport's window (olcrtc#26).
  	tr.data.sndWnd, tr.control.sndWnd = tr.sendWindow, tr.sendWindow
@@ -1107,7 +1171,7 @@ index ab5d3b9e..c9fe0a5a 100644
  
  	tr.shaper = transport.NewShaper(cfg.Traffic, tr.Features())
  
-@@ -347,6 +360,10 @@ func (p *streamTransport) Connect(ctx context.Context) error {
+@@ -347,6 +362,10 @@ func (p *streamTransport) Connect(ctx context.Context) error {
  	// Connect. Without this the handshake round-trip that runs right after
  	// would deadlock: muxconn.Write spins on CanSend (which checks for a live
  	// KCP) while KCP only started on the first incoming peer frame.
@@ -1118,7 +1182,7 @@ index ab5d3b9e..c9fe0a5a 100644
  	switch started, err := p.data.start(p.epochHeader()); {
  	case err != nil:
  		logger.Infof("vp8channel: startKCP failed: %v", err)
-@@ -500,6 +517,9 @@ func (p *streamTransport) restartPlanes() {
+@@ -500,6 +519,9 @@ func (p *streamTransport) restartPlanes() {
  	p.data.restart(p.rotateEpochHeader())
  	p.control.restart(p.controlEpochHeader())
  	p.readdressPeers()
@@ -1129,10 +1193,13 @@ index ab5d3b9e..c9fe0a5a 100644
  
  // PeerSeen implements transport.PeerObserver: a frame with our binding token
 diff --git a/internal/transport/vp8channel/writer.go b/internal/transport/vp8channel/writer.go
-index 8d14deba..ec201afa 100644
+index 8d14deba..f348e2a3 100644
 --- a/internal/transport/vp8channel/writer.go
 +++ b/internal/transport/vp8channel/writer.go
-@@ -2,6 +2,8 @@ package vp8channel
+@@ -1,7 +1,11 @@
++// Changed by olcOS (https://github.com/olcOS/olcos-core): see docs/olcrtc.md there.
++
+ package vp8channel
  
  import (
  	"encoding/binary"
@@ -1141,7 +1208,7 @@ index 8d14deba..ec201afa 100644
  	"time"
  
  	"github.com/pion/webrtc/v4/pkg/media"
-@@ -38,7 +40,8 @@ func newWriterState(p *streamTransport) *writerState {
+@@ -38,7 +42,8 @@ func newWriterState(p *streamTransport) *writerState {
  		forceKeepaliveEvery: max(int(forceKeepalivePeriod/p.frameInterval), 1),
  		keyframeGap:         max(int(keyframeRequestGap/p.frameInterval), 1),
  		data: dataLane{
@@ -1151,7 +1218,7 @@ index 8d14deba..ec201afa 100644
  		},
  	}
  }
-@@ -51,7 +54,7 @@ func (w *writerState) releasePending() {
+@@ -51,7 +56,7 @@ func (w *writerState) releasePending() {
  }
  
  func (w *writerState) writeSample(data []byte) bool {
@@ -1160,7 +1227,7 @@ index 8d14deba..ec201afa 100644
  }
  
  // writeSampleLocked serializes every WriteSample call on the shared video
-@@ -99,7 +102,7 @@ func (p *streamTransport) writeLocked(data []byte, keyframe bool) bool {
+@@ -99,7 +104,7 @@ func (p *streamTransport) writeLocked(data []byte, keyframe bool) bool {
  	} else {
  		written = p.track.WriteSample(media.Sample{
  			Data:     data,
@@ -1169,7 +1236,7 @@ index 8d14deba..ec201afa 100644
  		}) == nil
  	}
  	if written {
-@@ -125,7 +128,17 @@ func (p *streamTransport) readyToSend(frame []byte) bool {
+@@ -125,7 +130,17 @@ func (p *streamTransport) readyToSend(frame []byte) bool {
  // A relay that asks for one (requestKeyframe) is answered on the next tick
  // rather than at the next beat, keyframeGap ticks after the last at the
  // soonest: until it has a keyframe it forwards nothing of the track.
@@ -1187,7 +1254,7 @@ index 8d14deba..ec201afa 100644
  	w.ticksSinceKeepalive++
  	due := w.ticksSinceKeepalive >= w.forceKeepaliveEvery
  	if !due && w.ticksSinceKeepalive >= w.keyframeGap && w.p.keyframeWanted.Load() {
-@@ -213,7 +226,7 @@ func (w *writerState) batchDatagramSampleFrom(src <-chan []byte, first []byte) [
+@@ -213,7 +228,7 @@ func (w *writerState) batchDatagramSampleFrom(src <-chan []byte, first []byte) [
  	if len(first) <= epochHdrLen || w.p.batchSize <= 1 {
  		return first
  	}
@@ -1196,7 +1263,7 @@ index 8d14deba..ec201afa 100644
  	sample = append(sample, first[:epochHdrLen]...)
  	sample = append(sample, datagramBatchMagic[:]...)
  	sample = appendBatchPacket(sample, first[epochHdrLen:])
-@@ -225,7 +238,7 @@ func (w *writerState) batchDatagramSampleFrom(src <-chan []byte, first []byte) [
+@@ -225,7 +240,7 @@ func (w *writerState) batchDatagramSampleFrom(src <-chan []byte, first []byte) [
  				return sample
  			}
  			payload := frame[epochHdrLen:]
@@ -1205,7 +1272,7 @@ index 8d14deba..ec201afa 100644
  				w.pendingDatagram = frame
  				return sample
  			}
-@@ -273,6 +286,15 @@ func (p *streamTransport) dataConn() *kcpConn {
+@@ -273,6 +288,15 @@ func (p *streamTransport) dataConn() *kcpConn {
  	return nil
  }
  
@@ -1221,7 +1288,7 @@ index 8d14deba..ec201afa 100644
  // dataWindow sets the single-peer data plane's KCP send window.
  //
  // ai-generated: the whole function.
-@@ -285,8 +307,9 @@ func (p *streamTransport) dataWindow(segments int) {
+@@ -285,8 +309,9 @@ func (p *streamTransport) dataWindow(segments int) {
  func (p *streamTransport) writerLoop() {
  	defer close(p.writerDone)
  
@@ -1232,7 +1299,7 @@ index 8d14deba..ec201afa 100644
  
  	w := newWriterState(p)
  	defer w.releasePending()
-@@ -308,6 +331,7 @@ func (p *streamTransport) writerLoop() {
+@@ -308,6 +333,7 @@ func (p *streamTransport) writerLoop() {
  			}
  			// Priority 3: drain a batched data frame (or send keepalive).
  			w.drainData()
@@ -1240,7 +1307,7 @@ index 8d14deba..ec201afa 100644
  		}
  	}
  }
-@@ -324,8 +348,9 @@ func (p *streamTransport) writerLoop() {
+@@ -324,8 +350,9 @@ func (p *streamTransport) writerLoop() {
  //
  // ai-generated: the lane in place of the pump's own batching.
  func (p *streamTransport) peerWriterPump(lane dataLane, done <-chan struct{}) {
@@ -1251,7 +1318,7 @@ index 8d14deba..ec201afa 100644
  
  	// Inject a decodable VP8 keyframe on the same cadence writerLoop uses for
  	// the client->server path. The server's per-peer bulk path previously
-@@ -346,13 +371,16 @@ func (p *streamTransport) peerWriterPump(lane dataLane, done <-chan struct{}) {
+@@ -346,13 +373,16 @@ func (p *streamTransport) peerWriterPump(lane dataLane, done <-chan struct{}) {
  		case <-done:
  			return
  		case <-ticker.C:
@@ -1270,7 +1337,7 @@ index 8d14deba..ec201afa 100644
  		}
  	}
  }
-@@ -388,7 +416,7 @@ func (p *streamTransport) batchSampleUpTo(
+@@ -388,7 +418,7 @@ func (p *streamTransport) batchSampleUpTo(
  		return first.data, nil
  	}
  
@@ -1279,7 +1346,7 @@ index 8d14deba..ec201afa 100644
  	sample = append(sample, first.data[:epochHdrLen]...)
  	sample = append(sample, kcpBatchMagic[:]...)
  	sample = appendBatchPacket(sample, first.data[epochHdrLen:])
-@@ -405,7 +433,7 @@ func (p *streamTransport) batchSampleUpTo(
+@@ -405,7 +435,7 @@ func (p *streamTransport) batchSampleUpTo(
  				continue
  			}
  			payload := frame.data[epochHdrLen:]
@@ -1288,7 +1355,7 @@ index 8d14deba..ec201afa 100644
  				return sample, frame
  			}
  			sample = appendBatchPacket(sample, payload)
-@@ -417,12 +445,12 @@ func (p *streamTransport) batchSampleUpTo(
+@@ -417,12 +447,12 @@ func (p *streamTransport) batchSampleUpTo(
  	return sample, nil
  }
  
@@ -1304,7 +1371,7 @@ index 8d14deba..ec201afa 100644
  	}
  	if cap(dst) < want {
  		return make([]byte, 0, want)
-@@ -442,3 +470,224 @@ func appendBatchPacket(dst, packet []byte) []byte {
+@@ -442,3 +472,224 @@ func appendBatchPacket(dst, packet []byte) []byte {
  	dst = append(dst, lenBuf[:]...)
  	return append(dst, packet...)
  }
