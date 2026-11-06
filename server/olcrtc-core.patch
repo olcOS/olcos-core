@@ -223,6 +223,177 @@ index 194b1a23..da83db78 100644
  // Connect brings up the underlying engine session.
  func (v *EngineVideoSession) Connect(ctx context.Context) error {
  	if err := v.session.Connect(ctx); err != nil {
+diff --git a/internal/transport/videochannel/gocodec.go b/internal/transport/videochannel/gocodec.go
+index 3ea51ea0..77c7665c 100644
+--- a/internal/transport/videochannel/gocodec.go
++++ b/internal/transport/videochannel/gocodec.go
+@@ -1,6 +1,9 @@
++// Changed by olcOS (https://github.com/olcOS/olcos-core): see docs/olcrtc.md there.
++
+ package videochannel
+ 
+ import (
++	"encoding/binary"
+ 	"errors"
+ 	"fmt"
+ 	"sync"
+@@ -61,24 +64,48 @@ const decoderQueueDepth = 8
+ 
+ type goDecoder struct {
+ 	dec       *vp8.Decoder
++	maxPixels int
+ 	frames    chan []byte
+ 	closed    atomic.Bool
+ 	closeOnce sync.Once
+ 	closeCh   chan struct{}
+ }
+ 
+-func newGoDecoder() *goDecoder {
++// newGoDecoder decodes frames of at most width x height pixels. Both ends
++// use one video size, so a larger keyframe comes from someone else in the
++// room. The decoder allocates its planes before it reads a macroblock, about
++// 400 MB for the 16383x16383 an 18-byte keyframe can declare, so such a
++// keyframe is dropped.
++//
++// ai-generated: the size limit, here, in vp8KeyframeSize and in PushSample.
++func newGoDecoder(width, height int) *goDecoder {
+ 	return &goDecoder{
+-		dec:     vp8.NewDecoder(),
+-		frames:  make(chan []byte, decoderQueueDepth),
+-		closeCh: make(chan struct{}),
++		dec:       vp8.NewDecoder(),
++		maxPixels: width * height,
++		frames:    make(chan []byte, decoderQueueDepth),
++		closeCh:   make(chan struct{}),
++	}
++}
++
++// vp8KeyframeSize returns the size a VP8 keyframe declares (RFC 6386, 9.1).
++// ok is false for an interframe or a sample too short to be a keyframe.
++func vp8KeyframeSize(sample []byte) (width, height int, ok bool) {
++	if len(sample) < 10 || sample[0]&0x01 != 0 ||
++		sample[3] != 0x9d || sample[4] != 0x01 || sample[5] != 0x2a {
++		return 0, 0, false
+ 	}
++	width = int(binary.LittleEndian.Uint16(sample[6:8]) & 0x3fff)
++	height = int(binary.LittleEndian.Uint16(sample[8:10]) & 0x3fff)
++	return width, height, true
+ }
+ 
+ func (d *goDecoder) PushSample(sample []byte) error {
+ 	if d.closed.Load() {
+ 		return ErrTransportClosed
+ 	}
++	if w, h, ok := vp8KeyframeSize(sample); ok && w*h > d.maxPixels {
++		return nil
++	}
+ 	frame, err := d.dec.Decode(sample)
+ 	if err != nil {
+ 		if errors.Is(err, vp8.ErrNoReference) {
+diff --git a/internal/transport/videochannel/reader_test.go b/internal/transport/videochannel/reader_test.go
+index 0bde4a45..fb1179a8 100644
+--- a/internal/transport/videochannel/reader_test.go
++++ b/internal/transport/videochannel/reader_test.go
+@@ -1,3 +1,5 @@
++// Changed by olcOS (https://github.com/olcOS/olcos-core): see docs/olcrtc.md there.
++
+ package videochannel
+ 
+ import (
+@@ -63,7 +65,7 @@ func TestReaderNeverWaitsOnTheDecoder(t *testing.T) {
+ 	source := &packetSource{packets: vp8Packets(t, w, h, frames)}
+ 
+ 	tr := &streamTransport{closeCh: make(chan struct{})}
+-	decoder := newGoDecoder() // nobody pops: its frame queue fills and PushSample blocks
++	decoder := newGoDecoder(w, h) // nobody pops: its frame queue fills and PushSample blocks
+ 	defer func() {
+ 		tr.closed.Store(true)
+ 		decoder.Close()
+@@ -108,7 +110,7 @@ func TestReaderDeliversFramesInOrder(t *testing.T) {
+ 	source := &packetSource{packets: vp8Packets(t, w, h, frames)}
+ 
+ 	tr := &streamTransport{closeCh: make(chan struct{})}
+-	decoder := newGoDecoder()
++	decoder := newGoDecoder(w, h)
+ 	defer func() {
+ 		tr.closed.Store(true) // the decode goroutine ends quietly, as it does on Close
+ 		decoder.Close()
+diff --git a/internal/transport/videochannel/transport.go b/internal/transport/videochannel/transport.go
+index 05b9d814..a1e992fb 100644
+--- a/internal/transport/videochannel/transport.go
++++ b/internal/transport/videochannel/transport.go
+@@ -1,3 +1,5 @@
++// Changed by olcOS (https://github.com/olcOS/olcos-core): see docs/olcrtc.md there.
++
+ // Package videochannel provides a byte transport over a visual video stream.
+ //
+ // Payload fragments are rendered into QR codes or tiles, encoded as ordinary
+@@ -512,7 +514,7 @@ func (p *streamTransport) handleRemoteTrack(track *webrtc.TrackRemote, receiver
+ 		return
+ 	}
+ 
+-	decoder := newGoDecoder()
++	decoder := newGoDecoder(p.videoW, p.videoH)
+ 
+ 	p.decoderMu.Lock()
+ 	if p.closed.Load() || p.decoders == nil || len(p.decoders) >= maxRemoteDecoders {
+diff --git a/internal/transport/videochannel/visual_vp8_test.go b/internal/transport/videochannel/visual_vp8_test.go
+index 48f2c3c9..44bb8605 100644
+--- a/internal/transport/videochannel/visual_vp8_test.go
++++ b/internal/transport/videochannel/visual_vp8_test.go
+@@ -1,3 +1,5 @@
++// Changed by olcOS (https://github.com/olcOS/olcos-core): see docs/olcrtc.md there.
++
+ package videochannel
+ 
+ import (
+@@ -5,6 +7,7 @@ import (
+ 	"errors"
+ 	"hash/crc32"
+ 	"math/rand/v2"
++	"runtime"
+ 	"testing"
+ 
+ 	grqr "github.com/zarazaex69/gr/qr"
+@@ -30,7 +33,7 @@ func vp8RoundTrip(t *testing.T, vis *visualCodec, w, h int, payload []byte) ([]b
+ 	if err != nil {
+ 		t.Fatalf("EncodeFrame() error = %v", err)
+ 	}
+-	dec := newGoDecoder()
++	dec := newGoDecoder(w, h)
+ 	defer dec.Close()
+ 	if err = dec.PushSample(sample); err != nil {
+ 		t.Fatalf("PushSample() error = %v", err)
+@@ -187,3 +190,29 @@ func TestQRLargerThanTheFrameIsAnError(t *testing.T) {
+ 		t.Fatalf("render() error = %v, want %v", err, ErrQRTooLarge)
+ 	}
+ }
++
++// TestDecoderDropsOversizedKeyframe is an 18-byte keyframe that declares
++// 16383x16383. Its planes and their grayscale copy take 640 MB, so a decoder
++// for 320x240 drops it before decoding.
++//
++// ai-generated: the whole test.
++func TestDecoderDropsOversizedKeyframe(t *testing.T) {
++	huge := []byte{0x00, 0x01, 0x00, 0x9d, 0x01, 0x2a, 0xff, 0x3f, 0xff, 0x3f, 0, 0, 0, 0, 0, 0, 0, 0}
++	if w, h, ok := vp8KeyframeSize(huge); !ok || w != 16383 || h != 16383 {
++		t.Fatalf("vp8KeyframeSize() = %d, %d, %v, want 16383, 16383, true", w, h, ok)
++	}
++	dec := newGoDecoder(320, 240)
++	defer dec.Close()
++	var before, after runtime.MemStats
++	runtime.ReadMemStats(&before)
++	if err := dec.PushSample(huge); err != nil {
++		t.Fatalf("PushSample() error = %v", err)
++	}
++	runtime.ReadMemStats(&after)
++	if grew := after.TotalAlloc - before.TotalAlloc; grew > 64<<20 {
++		t.Fatalf("PushSample() allocated %d MB for an oversized keyframe", grew>>20)
++	}
++	if n := len(dec.frames); n != 0 {
++		t.Fatalf("an oversized keyframe left %d frames to extract", n)
++	}
++}
 diff --git a/internal/transport/vp8channel/kcp.go b/internal/transport/vp8channel/kcp.go
 index 56d5d651..18ebf596 100644
 --- a/internal/transport/vp8channel/kcp.go
