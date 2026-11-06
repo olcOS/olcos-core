@@ -4,6 +4,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pion/rtcp"
+
 	"github.com/openlibrecommunity/olcrtc/internal/engine"
 )
 
@@ -79,5 +81,32 @@ func TestWaitForAckTimeoutAndClose(t *testing.T) {
 	close(s.closeCh)
 	if s.waitForAck("closed", ch, time.Second) {
 		t.Fatal("waitForAck(closeCh) = true")
+	}
+}
+
+// Telemost's relay wants single-packet frames and rare keyframes, so the
+// engine says so and passes the relay's keyframe requests on.
+
+func TestTheEngineAsksForSinglePacketFrames(t *testing.T) {
+	var s engine.SinglePacketRelay = &Session{}
+	if !s.SinglePacketRelay() {
+		t.Fatal("goolom does not ask for single-packet frames")
+	}
+	var _ engine.KeyframeRequestSource = &Session{}
+}
+
+func TestKeyframeRequestsReachTheTransport(t *testing.T) {
+	s := &Session{}
+	s.notePublisherRTCP([]rtcp.Packet{&rtcp.PictureLossIndication{}}) // nothing registered yet
+	requests := 0
+	s.SetKeyframeRequestHandler(func() { requests++ })
+	s.notePublisherRTCP([]rtcp.Packet{
+		&rtcp.ReceiverReport{},
+		&rtcp.PictureLossIndication{},
+		&rtcp.TransportLayerNack{},
+		&rtcp.FullIntraRequest{},
+	})
+	if requests != 2 {
+		t.Fatalf("%d requests passed on, want 2 (the PLI and the FIR)", requests)
 	}
 }

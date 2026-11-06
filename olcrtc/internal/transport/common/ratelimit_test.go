@@ -171,3 +171,29 @@ func TestEngineVideoSessionForwardsThePublishRateLimit(t *testing.T) {
 		t.Fatalf("EngineVideoSession.PublishRateLimit = %d, want 0", got)
 	}
 }
+
+type singlePacketSession struct{ notified func() }
+
+func (singlePacketSession) SinglePacketRelay() bool        { return true }
+func (s *singlePacketSession) SetKeyframeRequestHandler(cb func()) { s.notified = cb }
+
+func TestRelayCapabilitiesAreReadOffTheSession(t *testing.T) {
+	if SinglePacketRelay(struct{}{}) {
+		t.Fatal("a session that says nothing asks for single-packet frames")
+	}
+	if OnKeyframeRequest(struct{}{}, func() { t.Fatal("called") }) {
+		t.Fatal("a session that reports nothing took a handler")
+	}
+	s := &singlePacketSession{}
+	if !SinglePacketRelay(s) {
+		t.Fatal("the capability was not read")
+	}
+	called := false
+	if !OnKeyframeRequest(s, func() { called = true }) {
+		t.Fatal("a session that reports keyframe requests was refused")
+	}
+	s.notified()
+	if !called {
+		t.Fatal("the handler was not registered")
+	}
+}

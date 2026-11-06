@@ -173,6 +173,17 @@ type KeyframeRequestSource interface {
 	SetKeyframeRequestHandler(cb func())
 }
 
+// SinglePacketRelay is implemented by engines whose relay forwards a VP8
+// stream reliably only as frames of one RTP packet each, drops a large
+// keyframe outright and drops what it holds of a stream whenever a keyframe
+// arrives (Telemost since October 2026). A transport that publishes media
+// through such a relay keeps every frame to one packet, sends data as
+// interframes and writes a keyframe only when it has to; the relay's
+// keyframe requests reach it through KeyframeRequestSource.
+type SinglePacketRelay interface {
+	SinglePacketRelay() bool
+}
+
 // VideoTrackCapable is implemented by engines that can exchange video tracks.
 type VideoTrackCapable interface {
 	AddVideoTrack(track webrtc.TrackLocal) error

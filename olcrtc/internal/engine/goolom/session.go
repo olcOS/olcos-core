@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/pion/rtcp"
 	"github.com/pion/webrtc/v4"
 
 	"github.com/openlibrecommunity/olcrtc/internal/engine"
@@ -96,6 +97,9 @@ type TrafficShape struct {
 // Session is the Goolom engine handle.
 type Session struct {
 	dtlsProfile engine.DTLSProfile
+	// keyframeRequest is what the publishing transport registered for the
+	// relay's keyframe requests (engine.KeyframeRequestSource).
+	keyframeRequest atomic.Pointer[func()]
 	engine.Reconnector
 	engine.VideoTrackState
 
@@ -436,12 +440,46 @@ func (s *Session) attachPendingVideoTracks(pub *webrtc.PeerConnection) error {
 	return attachErr
 }
 
-// drainPublisherRTCP reads (and discards) RTCP feedback the SFU sends for our
-// published track. The read is required so the interceptor chain keeps
-// processing incoming RTCP; without an active reader it stalls.
+// drainPublisherRTCP reads the RTCP feedback the SFU sends for our published
+// track. The read is required so the interceptor chain keeps processing
+// incoming RTCP; without an active reader it stalls. A keyframe request
+// (PLI, FIR) is passed on to the transport, which writes keyframes rarely
+// and answers this one at once.
 func (s *Session) drainPublisherRTCP(sender *webrtc.RTPSender) {
 	if sender == nil {
 		return
 	}
-	go engine.DrainRTCP(sender)
+	go s.readPublisherRTCP(sender)
 }
+
+func (s *Session) readPublisherRTCP(sender *webrtc.RTPSender) {
+	for {
+		packets, _, err := sender.ReadRTCP()
+		if err != nil {
+			return
+		}
+		s.notePublisherRTCP(packets)
+	}
+}
+
+// notePublisherRTCP passes a keyframe request among packets on to the
+// registered handler.
+func (s *Session) notePublisherRTCP(packets []rtcp.Packet) {
+	for _, packet := range packets {
+		switch packet.(type) {
+		case *rtcp.PictureLossIndication, *rtcp.FullIntraRequest:
+			if fn := s.keyframeRequest.Load(); fn != nil {
+				(*fn)()
+			}
+		}
+	}
+}
+
+// SinglePacketRelay reports that Telemost's relay forwards only
+// single-packet frames reliably and flushes a stream on every keyframe
+// (engine.SinglePacketRelay).
+func (s *Session) SinglePacketRelay() bool { return true }
+
+// SetKeyframeRequestHandler registers cb for the relay's keyframe requests
+// (engine.KeyframeRequestSource).
+func (s *Session) SetKeyframeRequestHandler(cb func()) { s.keyframeRequest.Store(&cb) }

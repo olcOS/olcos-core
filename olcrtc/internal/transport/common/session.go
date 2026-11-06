@@ -107,6 +107,18 @@ func OnKeyframeRequest(session any, cb func()) bool {
 	return true
 }
 
+// SinglePacketRelay forwards engine.SinglePacketRelay.
+func (v *EngineVideoSession) SinglePacketRelay() bool {
+	return SinglePacketRelay(v.session)
+}
+
+// SinglePacketRelay reports whether a session's relay wants single-packet
+// frames (engine.SinglePacketRelay).
+func SinglePacketRelay(session any) bool {
+	relay, ok := session.(engine.SinglePacketRelay)
+	return ok && relay.SinglePacketRelay()
+}
+
 // Connect brings up the underlying engine session.
 func (v *EngineVideoSession) Connect(ctx context.Context) error {
 	if err := v.session.Connect(ctx); err != nil {
