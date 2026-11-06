@@ -21,7 +21,7 @@
 #                    from the list below that lets this server in)
 #   OLCOS_DNS        the resolver the server uses (default 1.1.1.1:53)
 #   OLCOS_SOURCE     where the pieces are fetched from: a raw olcOS/olcos-core tree
-#                    (default: main; the bootstrap in olcOS/olcos pins a release tag)
+#                    (default: main; the bootstrap in olcOS/olcos pins a commit)
 #
 # Everything the phones later do goes through the agent; SSH is only used by
 # this script, once. The script can be run again: an installed server is kept
