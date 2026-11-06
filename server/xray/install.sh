@@ -72,6 +72,23 @@ emit() {
 
 [[ "$(id -u)" == "0" ]] || die "run as root: Podman has to publish port ${PORT}"
 [[ "$ID" =~ ^[a-z0-9]+$ ]] || die "OLCOS_XRAY_ID must be lowercase letters and digits"
+# Every value below lands in the JSON config or the vless:// link as it is.
+HOST_RE='^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$'
+[[ "$NAME" =~ ^[A-Za-z0-9._-]{1,32}$ ]] || die "OLCOS_XRAY_NAME: up to 32 letters, digits, dots, dashes or underscores"
+if ! [[ "$PORT" =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then
+  die "OLCOS_XRAY_PORT must be a port number"
+fi
+if [[ -n "$TARGET" ]]; then
+  [[ "${TARGET%:443}" =~ $HOST_RE ]] || die "OLCOS_XRAY_TARGET must be host or host:443"
+fi
+if [[ -n "${OLCOS_XRAY_SNI:-}" ]]; then
+  IFS=',' read -r -a SNI_CHECK <<<"$OLCOS_XRAY_SNI"
+  for name in "${SNI_CHECK[@]}"; do
+    [[ "$name" =~ $HOST_RE ]] || die "OLCOS_XRAY_SNI: '${name}' is not a host name"
+  done
+fi
+# The tls ping output of every candidate, kept for the log in a private directory.
+PING_DIR="$(mktemp -d /tmp/olcos-xray-tlsping.XXXXXX)"
 
 # --- tools ---------------------------------------------------------------------
 TOOLS=(podman curl openssl python3 ss)
@@ -135,15 +152,16 @@ xray() { podman run --rm "${IMAGE}" "$@"; }
 #   Pinging without SNI / Handshake succeeded|Handshake failure: ...
 #   TLS Version: ... TLS 1.3
 #   Certificate chain's total length: 6476 (certs count: 2)
-# The verdict is the exit status; the ping output is kept in /tmp for the log.
+# The verdict is the exit status; the ping output is kept in PING_DIR for the log.
 probe_target() {
   local host="$1" out cert ip alpn
+  [[ "$host" =~ $HOST_RE ]] || { log "target ${host}: not a host name"; return 1; }
   case "$host" in
     *.ru|*.ir|*.cn|*apple.com|*icloud.com|*microsoft.com|*live.com|*office.com)
       log "target ${host}: on the high-risk list (Xray-core PR #6508)"; return 1 ;;
   esac
   out="$(xray tls ping "$host" 2>&1 || true)"
-  printf '%s\n' "$out" > "/tmp/olcos-xray-tlsping-${host}.txt"
+  printf '%s\n' "$out" > "${PING_DIR}/${host}.txt"
   grep -q 'TLS 1.3' <<<"$out" || { log "target ${host}: no TLS 1.3"; return 1; }
   cert="$(grep -m1 'total length' <<<"$out" | grep -oE '[0-9]+ \(' | grep -oE '[0-9]+' || true)"
   if [[ -n "$cert" && "$cert" -ge 8192 ]]; then
