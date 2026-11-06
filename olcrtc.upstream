@@ -1,0 +1,5 @@
+# The olcrtc release that olcrtc/ is based on. scripts/update-olcrtc.sh
+# rewrites this file; server/install.sh and the apps' checks read it.
+OLCRTC_REPO=https://github.com/ghostlane-project/olcrtc
+OLCRTC_TAG=v0.14.0
+OLCRTC_COMMIT=0955ba7f2041d1480524292c4af4135a192fe267
