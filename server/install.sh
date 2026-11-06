@@ -88,8 +88,13 @@ VP8_FPS=$((10#$VP8_FPS)); VP8_BATCH=$((10#$VP8_BATCH))
 # the candidates are asked from this server first (the probe the iOS app runs:
 # config.js is served, /xmpp-websocket upgrades, no token or guest-domain
 # login). After the install the server's own log tells whether it got into the
-# room; when it did not, the next server that answered is tried.
-JITSI_CANDIDATES="meet.egovm.ru meet.riddlerx.org conf.expressmoney.com meet.mamba.group meet.mirox.chat meet.ecopsy.com conference.ct.placetime.team jitsy.amateusfox.online webinar.knomary.dev meet.playform.ru webinar.devknomarylms.ru zgn-y-vc01.zignotch.com conf.hyperia.space jitsi.etudevs.ru meet1.arbitr.ru"
+# room; when it did not, the next server that answered is tried. The order is
+# by what a tunnel carried from a VPS in the Netherlands on 2026-11-06:
+# meet.riddlerx.org and meet.mamba.group about 9 Mbit/s each way,
+# conf.expressmoney.com 1.5; meet.egovm.ru (the apps' default) and
+# meet1.arbitr.ru answer Russian addresses only. meet.mirox.chat is left out:
+# it lets both sides in and carried nothing, in October and again in November.
+JITSI_CANDIDATES="meet.egovm.ru meet.riddlerx.org meet.mamba.group conf.expressmoney.com meet.ecopsy.com conference.ct.placetime.team jitsy.amateusfox.online webinar.knomary.dev meet.playform.ru webinar.devknomarylms.ru zgn-y-vc01.zignotch.com conf.hyperia.space jitsi.etudevs.ru meet1.arbitr.ru"
 JITSI_OPEN=""
 
 # Prints the host when it answers like an open Jitsi server.
