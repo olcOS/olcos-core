@@ -255,7 +255,7 @@ printf '%s\n' "$LINK" > "$WORK/invite.txt"; chmod 600 "$WORK/invite.txt"
 # Open the two ports where a host firewall is on; a cloud firewall must be
 # opened by hand (the note below).
 for p in "$AGENT_PORT" "$SHARE_PORT"; do
-    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi active; then ufw allow "$p"/tcp >/dev/null 2>&1 || true; fi
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then ufw allow "$p"/tcp >/dev/null 2>&1 || true; fi
     if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then firewall-cmd --add-port="$p"/tcp >/dev/null 2>&1 || true; firewall-cmd --permanent --add-port="$p"/tcp >/dev/null 2>&1 || true; fi
 done
 
