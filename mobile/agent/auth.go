@@ -13,8 +13,11 @@ import (
 )
 
 const (
-	maxSkew     = 300 * time.Second // |X-Olc-Time − now| must be within this
-	nonceMemory = 10 * time.Minute  // a nonce cannot be reused within this
+	maxSkew = 300 * time.Second // |X-Olc-Time − now| must be within this
+	// nonceMemory outlives the whole acceptance window (±maxSkew) with a
+	// margin, so a nonce is never forgotten while its request could still be
+	// accepted.
+	nonceMemory = 2*maxSkew + time.Minute
 	rateWindow  = time.Minute
 	rateLimit   = 20   // unauthenticated requests per source address per window
 	rateMemory  = 4096 // past this many addresses, the ones outside the window are dropped
@@ -74,6 +77,17 @@ func (a *authn) allow(remoteAddr string) bool {
 	}
 	e.count++
 	return e.count <= rateLimit
+}
+
+// limited reports whether this source address is already past the
+// unauthenticated rate limit in its current window. Unlike allow it counts
+// nothing: a device that signs its requests correctly never adds to the count.
+func (a *authn) limited(remoteAddr string) bool {
+	ip := hostOf(remoteAddr)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	e := a.rate[ip]
+	return e != nil && time.Since(e.since) <= rateWindow && e.count > rateLimit
 }
 
 // seenNonce records a nonce and reports whether it was already present within
@@ -147,9 +161,15 @@ func (a *authn) verify(cfg *Config, r *http.Request, body []byte, now time.Time)
 	return dev
 }
 
+// hostOf is the rate-limit key of a source: its IPv4 address, or the /64 of
+// an IPv6 one (a single host usually holds a whole /64).
 func hostOf(remoteAddr string) string {
-	if h, _, err := net.SplitHostPort(remoteAddr); err == nil {
-		return h
+	h := remoteAddr
+	if host, _, err := net.SplitHostPort(remoteAddr); err == nil {
+		h = host
 	}
-	return remoteAddr
+	if ip := net.ParseIP(h); ip != nil && ip.To4() == nil {
+		return ip.Mask(net.CIDRMask(64, 128)).String() + "/64"
+	}
+	return h
 }

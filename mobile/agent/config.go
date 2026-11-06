@@ -9,6 +9,7 @@ package agent
 
 import (
 	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
@@ -274,8 +275,14 @@ func deviceFromSPKIBase64(b64, name string, role Role, addedAt int64) (Device, e
 	if err != nil {
 		return Device{}, fmt.Errorf("owner key is not valid base64: %w", err)
 	}
-	if _, err := x509.ParsePKIXPublicKey(der); err != nil {
+	pub, err := x509.ParsePKIXPublicKey(der)
+	if err != nil {
 		return Device{}, fmt.Errorf("owner key is not a valid public key: %w", err)
+	}
+	// Requests are verified as ECDSA P-256 signatures (parsedKey, auth.go):
+	// any other key would burn its invite and then never sign a call.
+	if ec, ok := pub.(*ecdsa.PublicKey); !ok || ec.Curve != elliptic.P256() {
+		return Device{}, errors.New("owner key is not an ECDSA P-256 key")
 	}
 	return Device{
 		ID:        deviceIDFromSPKI(der),

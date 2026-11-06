@@ -484,3 +484,86 @@ func TestRateMemoryForgetsAddressesPastTheWindow(t *testing.T) {
 		t.Fatalf("rate map holds %d entries; only the two within the window may stay", len(a.rate))
 	}
 }
+
+// --- hardening ---------------------------------------------------------------
+
+func TestMemberCannotReadXrayLog(t *testing.T) {
+	k := newTestKey(t)
+	cfg := testConfig(k.device(RoleMember))
+	h := newHandler(cfg, testState(nil))
+	req := k.sign(t, "GET", "/"+cfg.Prefix+"/v1/rooms/olcos-xray-wxyz5678/log?lines=10", nil, time.Now(), "n-xray-log-member")
+	assert404(t, do(h, req))
+}
+
+func TestSourcePastTheLimitIsRefusedBeforeAuth(t *testing.T) {
+	k := newTestKey(t)
+	cfg := testConfig(k.device(RoleOwner))
+	h := newHandler(cfg, testState(nil))
+	for i := 0; i <= rateLimit; i++ {
+		junk := httptest.NewRequest("GET", "/wp-login.php", nil)
+		junk.RemoteAddr = "203.0.113.9:5555"
+		assert404(t, do(h, junk))
+	}
+	// Same source, correctly signed: refused until the window ends.
+	req := k.sign(t, "GET", "/"+cfg.Prefix+"/v1/status", nil, time.Now(), "n-limited")
+	assert404(t, do(h, req))
+	// Another source is not affected.
+	req = k.sign(t, "GET", "/"+cfg.Prefix+"/v1/status", nil, time.Now(), "n-other-source")
+	req.RemoteAddr = "198.51.100.7:40000"
+	if rec := do(h, req); rec.Code != 200 {
+		t.Fatalf("a signed request from another source got %d", rec.Code)
+	}
+}
+
+func TestHostOfGroupsIPv6By64(t *testing.T) {
+	a := hostOf("[2001:db8:1:2:aaaa::1]:443")
+	b := hostOf("[2001:db8:1:2:bbbb::2]:443")
+	c := hostOf("[2001:db8:1:3::1]:443")
+	if a != b || a == c {
+		t.Fatalf("hostOf: %q %q %q", a, b, c)
+	}
+	if got := hostOf("203.0.113.9:1234"); got != "203.0.113.9" {
+		t.Fatalf("hostOf IPv4 = %q", got)
+	}
+}
+
+func TestTailBufferKeepsTheTail(t *testing.T) {
+	b := &tailBuffer{max: 8}
+	for _, s := range []string{"0123", "4567", "89", "abcdefghijkl", "XY"} {
+		if n, err := b.Write([]byte(s)); err != nil || n != len(s) {
+			t.Fatalf("Write(%q) = %d, %v", s, n, err)
+		}
+	}
+	if got := b.String(); got != "ghijklXY" {
+		t.Fatalf("tail = %q", got)
+	}
+}
+
+func TestRunBashReturnsAfterTimeoutDespiteABackgroundChild(t *testing.T) {
+	start := time.Now()
+	code, out := runBash("sleep 30 & echo started; sleep 30", time.Second, 1024)
+	if code != 124 || !strings.Contains(out, "started") {
+		t.Fatalf("runBash = %d %q", code, out)
+	}
+	if took := time.Since(start); took > childPipeGrace+5*time.Second {
+		t.Fatalf("runBash took %v", took)
+	}
+}
+
+func TestPairKeyMustBeP256(t *testing.T) {
+	priv, err := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spki, err := x509.MarshalPKIXPublicKey(&priv.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := deviceFromSPKIBase64(base64.StdEncoding.EncodeToString(spki), "x", RoleMember, 0); err == nil {
+		t.Fatal("a P-384 key was accepted")
+	}
+	k := newTestKey(t)
+	if _, err := deviceFromSPKIBase64(base64.StdEncoding.EncodeToString(k.spki), "x", RoleMember, 0); err != nil {
+		t.Fatalf("a P-256 key was refused: %v", err)
+	}
+}

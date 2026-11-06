@@ -28,6 +28,11 @@ const (
 	maxLogLines    = 2000             // GET log line ceiling
 	eventsWait     = 25 * time.Second // events long-poll budget
 	scriptRunLimit = 10 * time.Second // per status-script timeout
+
+	requestReadLimit = 30 * time.Second // reading an unauthenticated request, body included
+	maxHeaderBytes   = 16 * 1024        // request header ceiling
+	maxConnections   = 512              // open connections, TLS handshakes included
+	childPipeGrace   = 5 * time.Second  // after a script exits or times out, how long its children may hold the output
 )
 
 var containerRE = regexp.MustCompile(`^(olcrtc-server|olcos-xray)-[a-z0-9-]+$`)
@@ -158,9 +163,21 @@ func (h *apiHandler) authenticate(r *http.Request, body []byte) *Device {
 }
 
 func (h *apiHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Until the caller proves who it is, the whole request (and whatever body
+	// net/http drains after a 404 to keep the connection) has a deadline: a
+	// slow body must not hold a connection open for free.
+	rc := http.NewResponseController(w)
+	_ = rc.SetReadDeadline(time.Now().Add(requestReadLimit))
+
 	// Outside the secret prefix: unauthenticated junk. Count it and vanish.
 	if !strings.HasPrefix(r.URL.Path, h.prefix) {
 		h.auth.allow(r.RemoteAddr)
+		writeCamouflage404(w)
+		return
+	}
+	// A source past the unauthenticated limit costs no body read and no
+	// signature check until its window ends.
+	if h.auth.limited(r.RemoteAddr) {
 		writeCamouflage404(w)
 		return
 	}
@@ -185,6 +202,8 @@ func (h *apiHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeCamouflage404(w)
 		return
 	}
+	// A known device: its exec and long-poll calls outlive the read deadline.
+	_ = rc.SetReadDeadline(time.Time{})
 
 	switch {
 	case rest == "status" && r.Method == http.MethodGet:
@@ -204,7 +223,7 @@ func (h *apiHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case rest == "scripts" && r.Method == http.MethodPut:
 		h.requireOwner(dev, w, func() { h.handleScripts(w, body) })
 	case strings.HasPrefix(rest, "rooms/"):
-		h.handleRooms(w, r, strings.TrimPrefix(rest, "rooms/"))
+		h.handleRooms(w, r, dev, strings.TrimPrefix(rest, "rooms/"))
 	default:
 		writeCamouflage404(w)
 	}
@@ -315,7 +334,9 @@ func (h *apiHandler) handleScripts(w http.ResponseWriter, body []byte) {
 }
 
 // handleRooms serves both POST rooms/{c}/{action} and GET rooms/{c}/log.
-func (h *apiHandler) handleRooms(w http.ResponseWriter, r *http.Request, tail string) {
+// A member may start, stop and read the rooms, but not the Xray log: Xray
+// names the client addresses of everyone using the server.
+func (h *apiHandler) handleRooms(w http.ResponseWriter, r *http.Request, dev *Device, tail string) {
 	parts := strings.Split(tail, "/")
 	if len(parts) != 2 {
 		writeCamouflage404(w)
@@ -328,6 +349,10 @@ func (h *apiHandler) handleRooms(w http.ResponseWriter, r *http.Request, tail st
 	}
 
 	if verb == "log" && r.Method == http.MethodGet {
+		if strings.HasPrefix(container, "olcos-xray-") && dev.Role != RoleOwner {
+			writeCamouflage404(w)
+			return
+		}
 		lines, _ := strconv.Atoi(r.URL.Query().Get("lines"))
 		if lines <= 0 || lines > maxLogLines {
 			lines = 200
@@ -380,11 +405,14 @@ func runBash(script string, timeout time.Duration, cap int) (int, string) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "bash", "-c", script)
-	var buf bytes.Buffer
-	cmd.Stdout = &buf
-	cmd.Stderr = &buf
+	// A background child (`cmd &`, nohup) inherits the output pipe; without
+	// WaitDelay, Run would wait for it long past the timeout.
+	cmd.WaitDelay = childPipeGrace
+	buf := &tailBuffer{max: cap}
+	cmd.Stdout = buf
+	cmd.Stderr = buf
 	err := cmd.Run()
-	out := capBytes(buf.String(), cap)
+	out := buf.String()
 	if ctx.Err() == context.DeadlineExceeded {
 		return 124, out + "\n[timed out]"
 	}
@@ -469,15 +497,63 @@ func Serve(dir string) error {
 		return err
 	}
 	peek := &tlsPeekListener{
-		Listener: ln,
+		Listener: newLimitListener(ln, maxConnections),
 		config:   &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12},
 	}
 	srv := &http.Server{
 		Handler:           h,
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       90 * time.Second,
+		MaxHeaderBytes:    maxHeaderBytes,
 	}
 	return srv.Serve(peek)
+}
+
+// limitListener hands out at most n open connections at a time: Accept waits
+// for a free slot, and a connection gives its slot back when it is closed. The
+// agent is built on the server from its sources alone, with no go.sum, so this
+// stays on the standard library.
+type limitListener struct {
+	net.Listener
+	slots chan struct{}
+	done  chan struct{}
+	once  sync.Once
+}
+
+func newLimitListener(l net.Listener, n int) *limitListener {
+	return &limitListener{Listener: l, slots: make(chan struct{}, n), done: make(chan struct{})}
+}
+
+func (l *limitListener) Accept() (net.Conn, error) {
+	select {
+	case l.slots <- struct{}{}:
+	case <-l.done:
+		return nil, net.ErrClosed
+	}
+	c, err := l.Listener.Accept()
+	if err != nil {
+		<-l.slots
+		return nil, err
+	}
+	return &limitConn{Conn: c, release: func() { <-l.slots }}, nil
+}
+
+func (l *limitListener) Close() error {
+	err := l.Listener.Close()
+	l.once.Do(func() { close(l.done) })
+	return err
+}
+
+type limitConn struct {
+	net.Conn
+	once    sync.Once
+	release func()
+}
+
+func (c *limitConn) Close() error {
+	err := c.Conn.Close()
+	c.once.Do(c.release)
+	return err
 }
 
 // tlsPeekListener wraps a TCP listener: it looks at the first byte of each

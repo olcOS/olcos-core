@@ -231,3 +231,36 @@ func capBytes(s string, max int) string {
 	// keep the tail — the most recent lines are the useful ones
 	return s[len(s)-max:]
 }
+
+// tailBuffer is an io.Writer that keeps only the last max bytes written, so a
+// noisy script costs a bounded amount of memory while it runs. It is safe for
+// the concurrent writes os/exec makes when Stdout and Stderr are the same.
+type tailBuffer struct {
+	mu  sync.Mutex
+	max int
+	buf []byte
+}
+
+func (t *tailBuffer) Write(p []byte) (int, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	n := len(p)
+	if t.max <= 0 {
+		return n, nil
+	}
+	if len(p) >= t.max {
+		t.buf = append(t.buf[:0], p[len(p)-t.max:]...)
+		return n, nil
+	}
+	if over := len(t.buf) + len(p) - t.max; over > 0 {
+		t.buf = append(t.buf[:0], t.buf[over:]...)
+	}
+	t.buf = append(t.buf, p...)
+	return n, nil
+}
+
+func (t *tailBuffer) String() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return string(t.buf)
+}
