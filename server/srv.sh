@@ -561,6 +561,33 @@ fi
 # podman pull "$IMAGE_NAME"
 # eoc olcrtc-ios-rejected
 
+# boc olcrtc-ios: the Go build needs about 1.4 GB of memory at its peak (measured on a 1 vCPU / 961 MB host: 928 MB of RAM plus 524 MB of swap), so a 1 GB VPS without swap gets the compiler killed. When the host has less than 2 GB of RAM, no swap and at least 4 GB of free disk, add a permanent 2 GB /swapfile. Hosts that refuse swap (OpenVZ, LXC) are left as they are.
+ensure_build_memory() {
+    local mem_kb swap_kb free_kb
+    mem_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null)
+    swap_kb=$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo 2>/dev/null)
+    [ "${mem_kb:-0}" -gt 0 ] && [ "${mem_kb:-0}" -lt 2000000 ] && [ "${swap_kb:-1}" -eq 0 ] || return 0
+    if [ "$(id -u)" -ne 0 ] || [ -e /swapfile ]; then
+        echo "[!] Less than 2 GB of RAM and no swap: the build may run out of memory"
+        return 0
+    fi
+    free_kb=$(df -Pk / 2>/dev/null | awk 'NR == 2 {print $4}')
+    if [ "${free_kb:-0}" -lt 4000000 ]; then
+        echo "[!] Less than 2 GB of RAM, no swap and under 4 GB of free disk: the build may run out of memory"
+        return 0
+    fi
+    if { fallocate -l 2G /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=2048 status=none 2>/dev/null; } &&
+        chmod 600 /swapfile && mkswap /swapfile >/dev/null 2>&1 && swapon /swapfile 2>/dev/null; then
+        grep -qs '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+        echo "[*] Added a 2 GB swap file (/swapfile): the server has less than 2 GB of RAM"
+    else
+        rm -f /swapfile
+        echo "[!] Could not add swap: the build may run out of memory"
+    fi
+}
+ensure_build_memory
+# eoc olcrtc-ios
+
 echo "[*] Building OlcRTC..."
 podman run --rm \
     --network host \
