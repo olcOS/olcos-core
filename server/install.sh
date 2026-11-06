@@ -14,7 +14,8 @@
 #   OLCOS_CARRIER    jitsi (default), telemost, vkcalls, salutejazz, mtslink …
 #   OLCOS_TRANSPORT  datachannel (default), vp8channel, seichannel …
 #   OLCOS_ROOM       the room (empty: a random Jitsi room is made)
-#   OLCOS_JITSI_URL  the Jitsi server for a Jitsi room
+#   OLCOS_JITSI_URL  the Jitsi server for a Jitsi room (empty: the first server
+#                    from the list below that lets this server in)
 #   OLCOS_DNS        the resolver the server uses (default 1.1.1.1:53)
 #   OLCOS_SOURCE     where the pieces are fetched from: a raw olcOS/olcos-core tree
 #                    (default: main; the bootstrap in olcOS/olcos pins a release tag)
@@ -61,6 +62,67 @@ fi
 [ -n "$HOST" ] || die "the server's public address could not be found: run again with OLCOS_HOST=<address>"
 say "server: $NAME at $HOST"
 
+# --- the Jitsi server --------------------------------------------------------
+# Many Jitsi servers let in only some countries, and one that works today may
+# refuse tomorrow. For a Jitsi room with neither OLCOS_JITSI_URL nor OLCOS_ROOM,
+# the candidates are asked from this server first (the probe the iOS app runs:
+# config.js is served, /xmpp-websocket upgrades, no token or guest-domain
+# login). After the install the server's own log tells whether it got into the
+# room; when it did not, the next server that answered is tried.
+JITSI_CANDIDATES="meet.egovm.ru meet.riddlerx.org conf.expressmoney.com meet.mamba.group meet.mirox.chat meet.ecopsy.com conference.ct.placetime.team jitsy.amateusfox.online webinar.knomary.dev meet.playform.ru webinar.devknomarylms.ru zgn-y-vc01.zignotch.com conf.hyperia.space jitsi.etudevs.ru meet1.arbitr.ru"
+JITSI_OPEN=""
+
+# Prints the host when it answers like an open Jitsi server.
+jitsi_answers() {
+    local h="$1" tmp cfg ws
+    tmp=$(mktemp)
+    cfg=$(curl -s -m 6 -o "$tmp" -w '%{http_code}' "https://$h/config.js" 2>/dev/null || true)
+    ws=$(curl -s -o /dev/null -m 6 --http1.1 -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+        -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+        -H 'Sec-WebSocket-Protocol: xmpp' -H "Origin: https://$h" \
+        -w '%{http_code}' "https://$h/xmpp-websocket" 2>/dev/null || true)
+    if [ "$cfg" = 200 ] && [ "$ws" = 101 ] &&
+        ! grep -Eq '^[[:space:]]*(anonymousdomain|tokenAuthUrl)[[:space:]]*:' "$tmp"; then
+        printf '%s\n' "$h"
+    fi
+    rm -f "$tmp"
+}
+
+# 0 once the server container logs that it is in its room (since the Unix time
+# $2), 1 when it logs a failure or a minute passes. A refused XMPP dial takes
+# about 40 seconds to fail.
+in_room() {
+    local c="$1" since="$2" out
+    for _ in $(seq 1 30); do
+        out=$(podman logs --since "$since" "$c" 2>&1 | tail -n 40 || true)
+        case "$out" in *"Link connected"*) return 0 ;; esac
+        case "$out" in *"failed to connect link"*) return 1 ;; esac
+        sleep 2
+    done
+    return 1
+}
+
+if [ "${OLCOS_CARRIER:-jitsi}" = jitsi ] && [ -z "${OLCOS_JITSI_URL:-}" ] && [ -z "${OLCOS_ROOM:-}" ] &&
+    { [ "${OLCOS_REINSTALL:-0}" = "1" ] || [ ! -s "$WORK/uri.txt" ]; }; then
+    say "checking which Jitsi servers let this server in"
+    PROBE_DIR=$(mktemp -d)
+    i=0
+    PROBES=""
+    for h in $JITSI_CANDIDATES; do
+        i=$((i + 1))
+        jitsi_answers "$h" > "$PROBE_DIR/$(printf '%02d' "$i")" &
+        PROBES="$PROBES $!"
+    done
+    # Each probe by its PID: a bare `wait` would also wait for the tee that
+    # writes install.log, which never ends.
+    for p in $PROBES; do wait "$p" || true; done
+    JITSI_OPEN=$(cat "$PROBE_DIR"/* | tr '\n' ' ' | sed 's/ *$//')
+    rm -rf "$PROBE_DIR"
+    [ -n "$JITSI_OPEN" ] || die "no Jitsi server from the list lets this server in: name one with OLCOS_JITSI_URL=https://… or pick another service with OLCOS_CARRIER"
+    OLCOS_JITSI_URL="https://${JITSI_OPEN%% *}"
+    say "Jitsi servers that answer: $JITSI_OPEN"
+fi
+
 # --- the olcrtc server -------------------------------------------------------
 EXISTING=$(podman ps -a --format '{{.Names}}' 2>/dev/null | grep -E '^olcrtc-server-[a-z0-9]+$' | head -n 1 || true)
 if [ -n "$EXISTING" ] && [ -s "$WORK/uri.txt" ] && [ "${OLCOS_REINSTALL:-0}" != "1" ]; then
@@ -94,6 +156,27 @@ else
     CONTAINER=$(sed -n 's/^OLCRTC_CONTAINER=//p' "$WORK/srv.log" | tail -n 1 | tr -d '\r')
     [ -n "$URI" ] || die "the server printed no connection link (see $WORK/srv.log)"
     [ -n "$CONTAINER" ] || CONTAINER=$(podman ps -a --format '{{.Names}}' | grep -E '^olcrtc-server-[a-z0-9]+$' | head -n 1)
+    if [ -n "$JITSI_OPEN" ]; then
+        DEPLOY=$(podman inspect -f '{{range .Mounts}}{{if eq .Destination "/app"}}{{.Source}}{{end}}{{end}}' "$CONTAINER" 2>/dev/null || true)
+        ROOM=$(sed -n 's/^  id: "\(https:\/\/[^"]*\)"$/\1/p' "$DEPLOY/server.yaml" 2>/dev/null | head -n 1)
+        say "checking that the server gets into its Jitsi room"
+        if [ -n "$ROOM" ] && ! in_room "$CONTAINER" "$(date -d '-5 minutes' +%s 2>/dev/null || echo 0)"; then
+            JOINED=0
+            for h in ${JITSI_OPEN#* }; do
+                [ "$h" != "${JITSI_OPEN%% *}" ] || continue
+                NEW_ROOM="https://$h/${ROOM##*/}"
+                say "the server did not get into ${ROOM%/*}: trying https://$h"
+                sed -i "s|^  id: \"$ROOM\"\$|  id: \"$NEW_ROOM\"|" "$DEPLOY/server.yaml"
+                SINCE=$(date +%s)
+                podman restart "$CONTAINER" >/dev/null 2>&1 || true
+                URI=${URI//"$ROOM"/"$NEW_ROOM"}
+                ROOM=$NEW_ROOM
+                if in_room "$CONTAINER" "$SINCE"; then JOINED=1; break; fi
+            done
+            [ "$JOINED" = 1 ] || say "WARNING: the server did not get into a room on any Jitsi server that answered. Add another service from the app (VK Calls, Telemost …) or set OLCOS_JITSI_URL."
+        fi
+        say "Jitsi room: $ROOM"
+    fi
     printf '%s\n' "$URI" > "$WORK/uri.txt"; chmod 600 "$WORK/uri.txt"
     say "server container: $CONTAINER"
 fi
