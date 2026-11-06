@@ -144,7 +144,9 @@ func RenderClientConfig(p engine.Profile, o ClientOptions) ([]byte, error) {
 	}
 
 	cfg := map[string]any{
-		"log": map[string]any{"loglevel": level},
+		// No access log: it would put every destination the phone visits
+		// into the app's log.
+		"log": map[string]any{"loglevel": level, "access": "none", "dnsLog": false},
 		// stats + policy expose outbound>>>proxy>>>traffic>>>{uplink,downlink}
 		// counters that engine.Session.Stats reads for the measured hero picture.
 		"stats": map[string]any{},
@@ -251,7 +253,9 @@ func RenderServerConfig(o ServerOptions) ([]byte, error) {
 		mtd = 60000
 	}
 	cfg := map[string]any{
-		"log": map[string]any{"loglevel": level},
+		// No access log: Xray would otherwise print every client address and
+		// destination to stdout, that is to `podman logs` (and the agent).
+		"log": map[string]any{"loglevel": level, "access": "none", "dnsLog": false},
 		"inbounds": []any{map[string]any{
 			"tag": "vless-in", "listen": "0.0.0.0", "port": o.Port, "protocol": "vless",
 			"settings": map[string]any{
@@ -274,6 +278,23 @@ func RenderServerConfig(o ServerOptions) ([]byte, error) {
 			map[string]any{"tag": "direct", "protocol": "freedom"},
 			map[string]any{"tag": "block", "protocol": "blackhole"},
 		},
+		// A client must not reach the server's own services or its provider's
+		// private network through the proxy (cloud metadata at 169.254.169.254
+		// among them): by IP and, through IPIfNonMatch, by a name resolving to one.
+		"routing": map[string]any{
+			"domainStrategy": "IPIfNonMatch",
+			"rules": []any{map[string]any{
+				"type": "field", "outboundTag": "block", "ip": PrivateNets,
+			}},
+		},
 	}
 	return json.MarshalIndent(cfg, "", "  ")
+}
+
+// PrivateNets are the destinations a server never proxies to. Written out
+// instead of geoip:private so a config does not depend on geoip.dat; the
+// server script carries the same list.
+var PrivateNets = []string{
+	"0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
+	"172.16.0.0/12", "192.168.0.0/16", "::1/128", "fc00::/7", "fe80::/10",
 }

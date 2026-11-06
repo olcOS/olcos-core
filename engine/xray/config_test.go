@@ -2,6 +2,9 @@ package xray
 
 import (
 	"encoding/json"
+	"os"
+	"regexp"
+	"slices"
 	"strings"
 	"testing"
 
@@ -147,5 +150,73 @@ func TestRenderServer(t *testing.T) {
 	}
 	if _, err := RenderServerConfig(ServerOptions{Port: 443, ClientUUID: "x"}); err == nil {
 		t.Error("incomplete server options must fail")
+	}
+	var cfg struct {
+		Routing struct {
+			DomainStrategy string `json:"domainStrategy"`
+			Rules          []struct {
+				OutboundTag string   `json:"outboundTag"`
+				IP          []string `json:"ip"`
+			} `json:"rules"`
+		} `json:"routing"`
+	}
+	if err := json.Unmarshal(out, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Routing.DomainStrategy != "IPIfNonMatch" || len(cfg.Routing.Rules) != 1 ||
+		cfg.Routing.Rules[0].OutboundTag != "block" {
+		t.Fatalf("private destinations must be routed to the blackhole: %+v", cfg.Routing)
+	}
+	for _, want := range []string{"127.0.0.0/8", "169.254.0.0/16", "10.0.0.0/8", "::1/128"} {
+		if !slices.Contains(cfg.Routing.Rules[0].IP, want) {
+			t.Errorf("%s is not blocked: %v", want, cfg.Routing.Rules[0].IP)
+		}
+	}
+}
+
+// The server script writes the same private-network list as the Go reference.
+func TestServerScriptBlocksTheSamePrivateNets(t *testing.T) {
+	script, err := os.ReadFile("../../server/xray/install.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := regexp.MustCompile(`(?m)^PRIVATE_NETS_JSON='(\[.*\])'$`).FindSubmatch(script)
+	if m == nil {
+		t.Fatal("PRIVATE_NETS_JSON not found in server/xray/install.sh")
+	}
+	var nets []string
+	if err := json.Unmarshal(m[1], &nets); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(nets, PrivateNets) {
+		t.Errorf("server/xray/install.sh blocks %v, the Go reference %v", nets, PrivateNets)
+	}
+}
+
+func TestConfigsKeepNoAccessLog(t *testing.T) {
+	client, err := RenderClientConfig(sample(), ClientOptions{SocksPort: 1080, TunFD: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := RenderServerConfig(ServerOptions{
+		Port: 443, ClientUUID: sample().Secret, Target: "www.example.com:443",
+		ServerNames: []string{"www.example.com"}, PrivateKey: "KEY", ShortIDs: []string{"6ba85179e30d4fc2"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, out := range map[string][]byte{"client": client, "server": server} {
+		var cfg struct {
+			Log struct {
+				Access string `json:"access"`
+				DNSLog bool   `json:"dnsLog"`
+			} `json:"log"`
+		}
+		if err := json.Unmarshal(out, &cfg); err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Log.Access != "none" || cfg.Log.DNSLog {
+			t.Errorf("%s log %+v: the access log must be off", name, cfg.Log)
+		}
 	}
 }

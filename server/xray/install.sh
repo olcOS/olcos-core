@@ -212,6 +212,12 @@ printf '%s\n' "$SID"  > "${KEYS}/shortid"
 
 # --- config ---------------------------------------------------------------------
 # Kept in sync with engine/xray.RenderServerConfig (Go is the reference).
+# A client must not reach this host's own services or its provider's private
+# network through the proxy (the agent's loopback side, cloud metadata at
+# 169.254.169.254): those addresses go to the blackhole, by IP and, through
+# IPIfNonMatch, by a name that resolves to one. Written out instead of
+# geoip:private so the config does not depend on geoip.dat.
+PRIVATE_NETS_JSON='["0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12", "192.168.0.0/16", "::1/128", "fc00::/7", "fe80::/10"]'
 SNI_JSON="$(python3 - "$SNI" <<'PY'
 import json, sys
 names=[s.strip() for s in sys.argv[1].split(",")]
@@ -220,7 +226,7 @@ PY
 )"
 cat > "${CONF}/10_inbound.json" <<JSON
 {
-  "log": { "loglevel": "warning" },
+  "log": { "loglevel": "warning", "access": "none", "dnsLog": false },
   "inbounds": [{
     "tag": "vless-in", "listen": "0.0.0.0", "port": ${PORT}, "protocol": "vless",
     "settings": {
@@ -242,7 +248,13 @@ cat > "${CONF}/10_inbound.json" <<JSON
   "outbounds": [
     { "tag": "direct", "protocol": "freedom" },
     { "tag": "block", "protocol": "blackhole" }
-  ]
+  ],
+  "routing": {
+    "domainStrategy": "IPIfNonMatch",
+    "rules": [
+      { "type": "field", "outboundTag": "block", "ip": ${PRIVATE_NETS_JSON} }
+    ]
+  }
 }
 JSON
 chown -R 65532:65532 "${CONF}"
