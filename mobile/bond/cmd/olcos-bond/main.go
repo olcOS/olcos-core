@@ -1,3 +1,10 @@
+//go:debug multipathtcp=0
+
+// The line above keeps MPTCP off on this public listener whatever go line the
+// generated go.mod carries: Go 1.24+ listens with MPTCP by default, and the
+// published root exploit for CVE-2026-98432 (a kernel TCP use-after-free) goes
+// through an MPTCP listener. A patched kernel is the real fix.
+
 // Command olcos-bond is the server side of bonding (package bond). It runs
 // on the VPS next to the olcrtc server, accepts the lanes' sub-connections on
 // one port and joins each stream back together before it dials the target.

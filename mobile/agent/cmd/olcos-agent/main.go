@@ -1,3 +1,10 @@
+//go:debug multipathtcp=0
+
+// The line above keeps MPTCP off on this public listener whatever go line the
+// generated go.mod carries: Go 1.24+ listens with MPTCP by default, and the
+// published root exploit for CVE-2026-98432 (a kernel TCP use-after-free) goes
+// through an MPTCP listener. A patched kernel is the real fix.
+
 // Command olcos-agent is the server side of HTTPS server management. The app
 // builds it on the VPS from the sources it ships (like olcos-bond), installs
 // it under /opt/olcos-agent, registers this phone as the owner, and runs it
