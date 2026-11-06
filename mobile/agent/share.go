@@ -13,6 +13,10 @@ import (
 	"time"
 )
 
+// shareInviteName names the invite a share link carries (the installer's
+// link for the first phone).
+const shareInviteName = "first phone"
+
 // A device invite published from the server itself, by the one-command
 // installer: the first phone scans it, gets the server's connections and
 // registers itself with the agent as the owner. The list, the cipher and the
@@ -65,8 +69,19 @@ func ShareList(dir string, o ShareOptions) (Share, error) {
 	var cfg *Config
 	var inv Invite
 	err := updateConfig(dir, func(c *Config) error {
+		now := time.Now()
+		// A new owner link replaces the one an earlier run printed: only the
+		// latest stays usable, so an old copy left in a log or a screenshot
+		// cannot make its finder the server's owner.
+		if role == RoleOwner {
+			for i, old := range c.Invites {
+				if old.Role == RoleOwner && old.Name == shareInviteName && old.usable(now) {
+					c.Invites[i].ExpiresAt = now.Unix()
+				}
+			}
+		}
 		var err error
-		inv, err = c.newInvite(role, "first phone", time.Duration(days)*24*time.Hour, time.Now())
+		inv, err = c.newInvite(role, shareInviteName, time.Duration(days)*24*time.Hour, now)
 		cfg = c
 		return err
 	})

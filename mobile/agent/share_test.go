@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestShareListWritesAListThePhonesCanOpen(t *testing.T) {
@@ -72,5 +73,36 @@ func TestInitWithoutAnOwnerLeavesNoDevice(t *testing.T) {
 	if inviteLink("2001:db8::1", 31000, strings.Repeat("0", 32), make([]byte, 32)) !=
 		"olcrtc-sub://[2001:db8::1]:31000/"+strings.Repeat("0", 32)+"?enc=v1#"+strings.Repeat("A", 43) {
 		t.Fatal("IPv6 link is not bracketed")
+	}
+}
+
+func TestANewOwnerShareRetiresTheEarlierOne(t *testing.T) {
+	dir := t.TempDir()
+	if _, _, err := Init(dir, 25113, "203.0.113.5", "", ""); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	opts := ShareOptions{
+		Name: "srv", Host: "203.0.113.5", SharePort: 31000,
+		URIs: []string{"olcrtc://jitsi?datachannel@https://meet.example.org/room#" + strings.Repeat("ab", 32)},
+		Role: "owner", Dir: filepath.Join(dir, "share"),
+	}
+	if _, err := ShareList(dir, opts); err != nil {
+		t.Fatalf("first share: %v", err)
+	}
+	if _, err := ShareList(dir, opts); err != nil {
+		t.Fatalf("second share: %v", err)
+	}
+	cfg, err := LoadConfig(dir)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	usable := 0
+	for _, inv := range cfg.Invites {
+		if inv.usable(time.Now()) {
+			usable++
+		}
+	}
+	if len(cfg.Invites) != 2 || usable != 1 {
+		t.Fatalf("invites %d, usable %d; want 2 and 1", len(cfg.Invites), usable)
 	}
 }

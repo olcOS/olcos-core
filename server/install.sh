@@ -248,7 +248,7 @@ if [ -z "$SHARE_PORT" ]; then
     done
     [ -n "$SHARE_PORT" ] || die "the share server did not start (see $WORK/share.err)"
 fi
-LINK=$("$AGENT_DIR/olcos-agent" share -dir "$AGENT_DIR" -name "$NAME" -host "$HOST" -share-port "$SHARE_PORT" -share-dir "$SHARE_DIR" -role owner -uri "$URI" | sed -n 's/^OLCOS_INVITE_LINK=//p')
+LINK=$("$AGENT_DIR/olcos-agent" share -dir "$AGENT_DIR" -name "$NAME" -host "$HOST" -share-port "$SHARE_PORT" -share-dir "$SHARE_DIR" -role owner -days 7 -uri "$URI" | sed -n 's/^OLCOS_INVITE_LINK=//p')
 [ -n "$LINK" ] || die "the invite could not be made"
 printf '%s\n' "$LINK" > "$WORK/invite.txt"; chmod 600 "$WORK/invite.txt"
 
