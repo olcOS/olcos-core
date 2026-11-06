@@ -1,3 +1,5 @@
+// Changed by olcOS (https://github.com/olcOS/olcos-core): see docs/olcrtc.md there.
+
 // Package videochannel provides a byte transport over a visual video stream.
 //
 // Payload fragments are rendered into QR codes or tiles, encoded as ordinary
@@ -512,7 +514,7 @@ func (p *streamTransport) handleRemoteTrack(track *webrtc.TrackRemote, receiver 
 		return
 	}
 
-	decoder := newGoDecoder()
+	decoder := newGoDecoder(p.videoW, p.videoH)
 
 	p.decoderMu.Lock()
 	if p.closed.Load() || p.decoders == nil || len(p.decoders) >= maxRemoteDecoders {

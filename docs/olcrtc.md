@@ -21,6 +21,9 @@ and why.
   relay's keyframe requests to the transport; on such a relay `vp8channel`
   sizes KCP segments to one packet, sends data as interframes and paces the
   data lane by acknowledged pushes.
+- `videochannel` drops a VP8 keyframe that declares a larger picture than the
+  configured video size. Another participant of the call could otherwise make
+  the decoder allocate several hundred megabytes with an 18-byte frame.
 - `olcrtc/mobile/zz_olcos_logflags.go` pins the log prefix the apps parse.
 - `olcrtc/internal/protect/zz_olcos_ipsec.go` keeps ICE off iOS IPsec tunnels.
 

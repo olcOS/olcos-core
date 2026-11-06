@@ -1,3 +1,5 @@
+// Changed by olcOS (https://github.com/olcOS/olcos-core): see docs/olcrtc.md there.
+
 package videochannel
 
 import (
@@ -63,7 +65,7 @@ func TestReaderNeverWaitsOnTheDecoder(t *testing.T) {
 	source := &packetSource{packets: vp8Packets(t, w, h, frames)}
 
 	tr := &streamTransport{closeCh: make(chan struct{})}
-	decoder := newGoDecoder() // nobody pops: its frame queue fills and PushSample blocks
+	decoder := newGoDecoder(w, h) // nobody pops: its frame queue fills and PushSample blocks
 	defer func() {
 		tr.closed.Store(true)
 		decoder.Close()
@@ -108,7 +110,7 @@ func TestReaderDeliversFramesInOrder(t *testing.T) {
 	source := &packetSource{packets: vp8Packets(t, w, h, frames)}
 
 	tr := &streamTransport{closeCh: make(chan struct{})}
-	decoder := newGoDecoder()
+	decoder := newGoDecoder(w, h)
 	defer func() {
 		tr.closed.Store(true) // the decode goroutine ends quietly, as it does on Close
 		decoder.Close()

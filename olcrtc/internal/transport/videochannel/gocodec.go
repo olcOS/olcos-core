@@ -1,6 +1,9 @@
+// Changed by olcOS (https://github.com/olcOS/olcos-core): see docs/olcrtc.md there.
+
 package videochannel
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"sync"
@@ -61,23 +64,47 @@ const decoderQueueDepth = 8
 
 type goDecoder struct {
 	dec       *vp8.Decoder
+	maxPixels int
 	frames    chan []byte
 	closed    atomic.Bool
 	closeOnce sync.Once
 	closeCh   chan struct{}
 }
 
-func newGoDecoder() *goDecoder {
+// newGoDecoder decodes frames of at most width x height pixels. Both ends
+// use one video size, so a larger keyframe comes from someone else in the
+// room. The decoder allocates its planes before it reads a macroblock, about
+// 400 MB for the 16383x16383 an 18-byte keyframe can declare, so such a
+// keyframe is dropped.
+//
+// ai-generated: the size limit, here, in vp8KeyframeSize and in PushSample.
+func newGoDecoder(width, height int) *goDecoder {
 	return &goDecoder{
-		dec:     vp8.NewDecoder(),
-		frames:  make(chan []byte, decoderQueueDepth),
-		closeCh: make(chan struct{}),
+		dec:       vp8.NewDecoder(),
+		maxPixels: width * height,
+		frames:    make(chan []byte, decoderQueueDepth),
+		closeCh:   make(chan struct{}),
 	}
+}
+
+// vp8KeyframeSize returns the size a VP8 keyframe declares (RFC 6386, 9.1).
+// ok is false for an interframe or a sample too short to be a keyframe.
+func vp8KeyframeSize(sample []byte) (width, height int, ok bool) {
+	if len(sample) < 10 || sample[0]&0x01 != 0 ||
+		sample[3] != 0x9d || sample[4] != 0x01 || sample[5] != 0x2a {
+		return 0, 0, false
+	}
+	width = int(binary.LittleEndian.Uint16(sample[6:8]) & 0x3fff)
+	height = int(binary.LittleEndian.Uint16(sample[8:10]) & 0x3fff)
+	return width, height, true
 }
 
 func (d *goDecoder) PushSample(sample []byte) error {
 	if d.closed.Load() {
 		return ErrTransportClosed
+	}
+	if w, h, ok := vp8KeyframeSize(sample); ok && w*h > d.maxPixels {
+		return nil
 	}
 	frame, err := d.dec.Decode(sample)
 	if err != nil {

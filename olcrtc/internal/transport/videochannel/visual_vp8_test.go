@@ -1,3 +1,5 @@
+// Changed by olcOS (https://github.com/olcOS/olcos-core): see docs/olcrtc.md there.
+
 package videochannel
 
 import (
@@ -5,6 +7,7 @@ import (
 	"errors"
 	"hash/crc32"
 	"math/rand/v2"
+	"runtime"
 	"testing"
 
 	grqr "github.com/zarazaex69/gr/qr"
@@ -30,7 +33,7 @@ func vp8RoundTrip(t *testing.T, vis *visualCodec, w, h int, payload []byte) ([]b
 	if err != nil {
 		t.Fatalf("EncodeFrame() error = %v", err)
 	}
-	dec := newGoDecoder()
+	dec := newGoDecoder(w, h)
 	defer dec.Close()
 	if err = dec.PushSample(sample); err != nil {
 		t.Fatalf("PushSample() error = %v", err)
@@ -185,5 +188,31 @@ func TestQRLargerThanTheFrameIsAnError(t *testing.T) {
 	}
 	if _, err := vis.render([]byte("does not fit")); !errors.Is(err, ErrQRTooLarge) {
 		t.Fatalf("render() error = %v, want %v", err, ErrQRTooLarge)
+	}
+}
+
+// TestDecoderDropsOversizedKeyframe is an 18-byte keyframe that declares
+// 16383x16383. Its planes and their grayscale copy take 640 MB, so a decoder
+// for 320x240 drops it before decoding.
+//
+// ai-generated: the whole test.
+func TestDecoderDropsOversizedKeyframe(t *testing.T) {
+	huge := []byte{0x00, 0x01, 0x00, 0x9d, 0x01, 0x2a, 0xff, 0x3f, 0xff, 0x3f, 0, 0, 0, 0, 0, 0, 0, 0}
+	if w, h, ok := vp8KeyframeSize(huge); !ok || w != 16383 || h != 16383 {
+		t.Fatalf("vp8KeyframeSize() = %d, %d, %v, want 16383, 16383, true", w, h, ok)
+	}
+	dec := newGoDecoder(320, 240)
+	defer dec.Close()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	if err := dec.PushSample(huge); err != nil {
+		t.Fatalf("PushSample() error = %v", err)
+	}
+	runtime.ReadMemStats(&after)
+	if grew := after.TotalAlloc - before.TotalAlloc; grew > 64<<20 {
+		t.Fatalf("PushSample() allocated %d MB for an oversized keyframe", grew>>20)
+	}
+	if n := len(dec.frames); n != 0 {
+		t.Fatalf("an oversized keyframe left %d frames to extract", n)
 	}
 }
