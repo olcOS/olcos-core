@@ -1,3 +1,5 @@
+// Changed by olcOS (https://github.com/olcOS/olcos-core): see docs/olcrtc.md there.
+
 package common
 
 import (

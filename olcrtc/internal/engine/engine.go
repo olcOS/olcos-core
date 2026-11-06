@@ -1,3 +1,5 @@
+// Changed by olcOS (https://github.com/olcOS/olcos-core): see docs/olcrtc.md there.
+
 // Package engine defines the wire-level transport engine that connects to a
 // remote SFU. An engine is independent of how the room credentials were
 // obtained: it accepts a signaling URL and an access token, and exposes the

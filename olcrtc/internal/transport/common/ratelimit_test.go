@@ -1,3 +1,5 @@
+// Changed by olcOS (https://github.com/olcOS/olcos-core): see docs/olcrtc.md there.
+
 package common
 
 import (
@@ -174,7 +176,7 @@ func TestEngineVideoSessionForwardsThePublishRateLimit(t *testing.T) {
 
 type singlePacketSession struct{ notified func() }
 
-func (singlePacketSession) SinglePacketRelay() bool        { return true }
+func (singlePacketSession) SinglePacketRelay() bool                { return true }
 func (s *singlePacketSession) SetKeyframeRequestHandler(cb func()) { s.notified = cb }
 
 func TestRelayCapabilitiesAreReadOffTheSession(t *testing.T) {

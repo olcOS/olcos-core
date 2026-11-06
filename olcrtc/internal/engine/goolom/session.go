@@ -1,3 +1,5 @@
+// Changed by olcOS (https://github.com/olcOS/olcos-core): see docs/olcrtc.md there.
+
 // Package goolom implements an engine.Session backed by the Goolom SFU
 // signaling protocol. Goolom is the proprietary SFU developed for Yandex
 // Telemost; the on-wire protocol - capabilities offer, separated subscriber

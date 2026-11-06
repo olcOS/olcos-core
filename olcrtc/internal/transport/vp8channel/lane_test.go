@@ -1,3 +1,5 @@
+// Changed by olcOS (https://github.com/olcOS/olcos-core): see docs/olcrtc.md there.
+
 package vp8channel
 
 // ai-generated: the whole file (issue #12: the data lane against an SFU that

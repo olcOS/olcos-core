@@ -1,3 +1,5 @@
+// Changed by olcOS (https://github.com/olcOS/olcos-core): see docs/olcrtc.md there.
+
 // Package vp8channel disguises a KCP-based byte transport as a stream of
 // valid VP8 keyframes so SFUs that validate bitstream conformance let the
 // payload through. The package owns its own KCP framing; the per-message
