@@ -1,6 +1,6 @@
 #!/bin/bash
 # olcOS server installer: one command on a fresh VPS (Debian, Ubuntu, Fedora,
-# CentOS; root). It installs the olcrtc server (Jitsi / data channel unless
+# CentOS; root). It installs the olcrtc server (Jitsi / vp8channel unless
 # told otherwise), the olcOS agent, and prints a device invite with full
 # management: scan it with olcOS on any phone — that phone becomes the owner
 # and manages everything else from the app (rooms, protocols, invites for the
@@ -12,7 +12,10 @@
 #   OLCOS_NAME       the server's name on the phone (default: the hostname)
 #   OLCOS_HOST       the public address the phone reaches (default: detected)
 #   OLCOS_CARRIER    jitsi (default), telemost, vkcalls, salutejazz, mtslink …
-#   OLCOS_TRANSPORT  datachannel (default), vp8channel, seichannel …
+#   OLCOS_TRANSPORT  vp8channel (default; datachannel for SaluteJazz and MAX),
+#                    datachannel, seichannel …
+#   OLCOS_VP8_FPS    vp8channel frames per second (default 30, 1-120)
+#   OLCOS_VP8_BATCH  vp8channel packets per frame (default 64, 1-256)
 #   OLCOS_ROOM       the room (empty: a random Jitsi room is made)
 #   OLCOS_JITSI_URL  the Jitsi server for a Jitsi room (empty: the first server
 #                    from the list below that lets this server in)
@@ -62,6 +65,23 @@ fi
 [ -n "$HOST" ] || die "the server's public address could not be found: run again with OLCOS_HOST=<address>"
 say "server: $NAME at $HOST"
 
+# --- the service and the transport ------------------------------------------
+# The transport by service, as measured from a VPS: on two Jitsi servers a
+# vp8channel tunnel (30 frames of 64 packets a second) carried about 9 Mbit/s
+# each way, the data channel 1 Mbit/s down. SaluteJazz and MAX give a guest
+# data channels alone, Telemost, VK Calls and MTS Link vp8channel alone.
+CARRIER="${OLCOS_CARRIER:-jitsi}"
+case "$CARRIER" in
+    salutejazz|max) TRANSPORT="${OLCOS_TRANSPORT:-datachannel}" ;;
+    *) TRANSPORT="${OLCOS_TRANSPORT:-vp8channel}" ;;
+esac
+VP8_FPS="${OLCOS_VP8_FPS:-30}"
+VP8_BATCH="${OLCOS_VP8_BATCH:-64}"
+in_range() { [[ "$1" =~ ^[0-9]{1,3}$ ]] && [ "$((10#$1))" -ge "$2" ] && [ "$((10#$1))" -le "$3" ]; }
+in_range "$VP8_FPS" 1 120 || die "OLCOS_VP8_FPS must be a whole number from 1 to 120"
+in_range "$VP8_BATCH" 1 256 || die "OLCOS_VP8_BATCH must be a whole number from 1 to 256"
+VP8_FPS=$((10#$VP8_FPS)); VP8_BATCH=$((10#$VP8_BATCH))
+
 # --- the Jitsi server --------------------------------------------------------
 # Many Jitsi servers let in only some countries, and one that works today may
 # refuse tomorrow. For a Jitsi room with neither OLCOS_JITSI_URL nor OLCOS_ROOM,
@@ -102,7 +122,7 @@ in_room() {
     return 1
 }
 
-if [ "${OLCOS_CARRIER:-jitsi}" = jitsi ] && [ -z "${OLCOS_JITSI_URL:-}" ] && [ -z "${OLCOS_ROOM:-}" ] &&
+if [ "$CARRIER" = jitsi ] && [ -z "${OLCOS_JITSI_URL:-}" ] && [ -z "${OLCOS_ROOM:-}" ] &&
     { [ "${OLCOS_REINSTALL:-0}" = "1" ] || [ ! -s "$WORK/uri.txt" ]; }; then
     say "checking which Jitsi servers let this server in"
     PROBE_DIR=$(mktemp -d)
@@ -143,7 +163,8 @@ else
     PATCH_ID=$(sha256sum "$WORK/olcrtc-core.patch" | cut -d' ' -f1)
     say "installing the olcrtc server (this takes 5-15 minutes: podman and a Go build)"
     set +e
-    env OLCRTC_CARRIER="${OLCOS_CARRIER:-jitsi}" OLCRTC_TRANSPORT="${OLCOS_TRANSPORT:-datachannel}" \
+    env OLCRTC_CARRIER="$CARRIER" OLCRTC_TRANSPORT="$TRANSPORT" \
+        OLCRTC_VP8_FPS="$VP8_FPS" OLCRTC_VP8_BATCH="$VP8_BATCH" \
         OLCRTC_ROOM_ID="${OLCOS_ROOM:-}" ${OLCOS_JITSI_URL:+OLCRTC_JITSI_URL="$OLCOS_JITSI_URL"} \
         OLCRTC_DNS="${OLCOS_DNS:-1.1.1.1:53}" OLCRTC_CONFIG_NAME=olcos-installer OLCRTC_PIN="$PIN" \
         OLCRTC_CORE_PATCH="$WORK/olcrtc-core.patch" OLCRTC_CORE_PATCH_ID="$PATCH_ID" \

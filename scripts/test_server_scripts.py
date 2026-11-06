@@ -105,6 +105,38 @@ class ServerInstall(unittest.TestCase):
             self.assertTrue((ROOT / "server" / "agent-status" / f"{status}.sh").is_file(), status)
 
 
+class InstallerTransport(unittest.TestCase):
+    """The installer starts each service on its fastest transport and checks
+    the VP8 numbers before they reach srv.sh."""
+
+    INSTALL = read("server/install.sh")
+    BLOCK = INSTALL.split("# --- the service and the transport", 1)[1].split("# --- the Jitsi server", 1)[0]
+
+    def run_block(self, **env):
+        script = 'die() { echo "DIE: $*"; exit 1; }\n' + self.BLOCK + 'echo "$CARRIER $TRANSPORT $VP8_FPS $VP8_BATCH"\n'
+        result = subprocess.run(["bash", "-c", script], env={"PATH": "/usr/bin:/bin", **env},
+                                capture_output=True, text=True, check=False)
+        return result.returncode, result.stdout.strip()
+
+    def test_each_service_starts_on_its_fastest_transport(self):
+        self.assertEqual(self.run_block(), (0, "jitsi vp8channel 30 64"))
+        self.assertEqual(self.run_block(OLCOS_CARRIER="telemost"), (0, "telemost vp8channel 30 64"))
+        self.assertEqual(self.run_block(OLCOS_CARRIER="salutejazz"), (0, "salutejazz datachannel 30 64"))
+        self.assertEqual(self.run_block(OLCOS_TRANSPORT="datachannel"), (0, "jitsi datachannel 30 64"))
+
+    def test_the_vp8_numbers_are_checked(self):
+        self.assertEqual(self.run_block(OLCOS_VP8_FPS="45", OLCOS_VP8_BATCH="096"), (0, "jitsi vp8channel 45 96"))
+        for env in ({"OLCOS_VP8_FPS": "0"}, {"OLCOS_VP8_FPS": "121"}, {"OLCOS_VP8_FPS": "3; reboot"},
+                    {"OLCOS_VP8_BATCH": "257"}, {"OLCOS_VP8_BATCH": "1e3"}):
+            code, out = self.run_block(**env)
+            self.assertEqual(code, 1, env)
+            self.assertTrue(out.startswith("DIE: OLCOS_VP8_"), (env, out))
+
+    def test_srv_gets_the_transport_and_the_vp8_numbers(self):
+        self.assertIn('env OLCRTC_CARRIER="$CARRIER" OLCRTC_TRANSPORT="$TRANSPORT" \\\n'
+                      '        OLCRTC_VP8_FPS="$VP8_FPS" OLCRTC_VP8_BATCH="$VP8_BATCH" \\', self.INSTALL)
+
+
 class RestartPolicy(unittest.TestCase):
     def test_new_containers_come_back_after_a_reboot(self):
         # podman-restart.service starts only restart-policy=always containers.
