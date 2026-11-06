@@ -509,6 +509,9 @@ echo "[*] Cleaning workspace..."
 rm -rf "$WORK_DIR"
 mkdir -p "$WORK_DIR"
 WORK_DIR=$(cd "$WORK_DIR" && pwd -P)
+# boc olcrtc-ios: server.yaml in the deploy directory carries the tunnel key — only root may read it
+chmod 700 "$WORK_DIR"
+# eoc olcrtc-ios
 
 CACHE_DIR="${OLCRTC_CACHE_DIR:-$HOME/.cache/olcrtc}"
 GOMOD_CACHE="$CACHE_DIR/gomod"
