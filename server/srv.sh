@@ -592,6 +592,7 @@ ensure_build_memory
 # eoc olcrtc-ios
 
 echo "[*] Building OlcRTC..."
+# boc olcrtc-ios: the pinned olcrtc requires golang.org/x/net v0.55.0, whose DNS message parser panics on a malformed SVCB/HTTPS record (GO-2026-5942, fixed in v0.56.0) and pion's mDNS reaches it — build the server with the x/net release the apps already link (rejected block below)
 podman run --rm \
     --network host \
     -v "$WORK_DIR":/app:Z \
@@ -599,7 +600,18 @@ podman run --rm \
     -v "$GO_BUILD_CACHE":/root/.cache/go-build:Z \
     -w /app \
     "$IMAGE_NAME" \
-    sh -c "go mod download && go build -trimpath -ldflags='-s -w' -o olcrtc ./cmd/olcrtc"
+    sh -c "go get golang.org/x/net@v0.62.0 && go mod download && go build -trimpath -ldflags='-s -w' -o olcrtc ./cmd/olcrtc"
+# eoc olcrtc-ios
+# boc olcrtc-ios-rejected: upstream builds with the x/net its go.mod pins (v0.55.0, GO-2026-5942) — replaced by the build above
+# podman run --rm \
+#     --network host \
+#     -v "$WORK_DIR":/app:Z \
+#     -v "$GOMOD_CACHE":/go/pkg/mod:Z \
+#     -v "$GO_BUILD_CACHE":/root/.cache/go-build:Z \
+#     -w /app \
+#     "$IMAGE_NAME" \
+#     sh -c "go mod download && go build -trimpath -ldflags='-s -w' -o olcrtc ./cmd/olcrtc"
+# eoc olcrtc-ios-rejected
 
 if [ ! -f "$WORK_DIR/olcrtc" ]; then
     echo "[X] Build failed"
