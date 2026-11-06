@@ -41,7 +41,9 @@ var (
 // socksRefusedError is a lane's SOCKS failure reply.
 type socksRefusedError struct{ code byte }
 
-func (e socksRefusedError) Error() string { return fmt.Sprintf("bond: lane refused (SOCKS5 reply %d)", e.code) }
+func (e socksRefusedError) Error() string {
+	return fmt.Sprintf("bond: lane refused (SOCKS5 reply %d)", e.code)
+}
 
 type socksRequest struct {
 	cmd    byte
