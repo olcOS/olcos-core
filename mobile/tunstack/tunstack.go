@@ -1,22 +1,24 @@
-// Package tunstack is the tun2socks layer of the iOS system-VPN mode: it
-// translates the NEPacketTunnelProvider's raw IP packets into TCP CONNECT
-// streams against the olcrtc core's loopback SOCKS5 listener running in the
-// same extension process.
+// Package tunstack is the tun2socks layer of the system-VPN mode of both
+// apps: it translates the raw IP packets the system hands the app (iOS:
+// NEPacketTunnelProvider, Android: VpnService) into TCP CONNECT streams
+// against the loopback SOCKS5 listener of the engine running in the same
+// process (the olcrtc core or the Xray engine).
 //
-// It is bound by gomobile into the SAME Mobile.xcframework as upstream's
-// mobile package (see ../go.mod); gomobile prefixes its Swift/ObjC names with
+// It is bound by gomobile into the SAME framework as upstream's mobile
+// package (see ../go.mod); gomobile prefixes its Swift/ObjC names with
 // "Tunstack" (TunstackNewTunnel, TunstackTunnel, TunstackTunWriterProtocol).
 //
-// Design constraints (see scratchpad/p23/vpn-impl-decisions.md):
+// Design constraints:
 //
-//   - The core's SOCKS5 server is CONNECT-only (olcrtc internal/client/
+//   - The engines' SOCKS5 listeners are CONNECT-only (olcrtc internal/client/
 //     socks.go rejects BIND and UDP ASSOCIATE), so UDP cannot be proxied.
-//     dnstruncate answers UDP DNS with the TC bit, which makes the OS
-//     resolver retry DNS over TCP:53 — that DOES ride the SOCKS tunnel.
-//     All other UDP is dropped by construction.
-//   - The SOCKS listener is loopback-only inside the extension, and the core
-//     requires credentials only for non-loopback listeners (mobile/config.go
-//     validateRuntimeConfig), so this client deliberately sends none.
+//     DNS is answered in this layer instead (names.go): a lookup the system
+//     sends over UDP goes to a resolver as a TCP stream through the listener
+//     and its reply returns as UDP. All other UDP is dropped by construction.
+//   - The SOCKS listener is loopback-only. The olcrtc core requires
+//     credentials only for non-loopback listeners (mobile/config.go
+//     validateRuntimeConfig); NewTunnelAuth presents the ones an app sets so
+//     that no other app on the phone can use the port.
 //
 // Outline SDK API used (verified against pkg.go.dev at v0.0.20):
 //
@@ -24,7 +26,7 @@
 //	    // *Client implements transport.StreamDialer (DialStream)
 //	transport.StreamDialerEndpoint{Dialer StreamDialer; Address string}
 //	transport.TCPDialer{Dialer net.Dialer}
-//	dnstruncate.NewPacketProxy() (network.PacketProxy, error)
+//	network.PacketProxy // NewSession(PacketResponseReceiver) (PacketRequestSender, error)
 //	lwip2transport.ConfigureDevice(sd transport.StreamDialer, pp network.PacketProxy) (network.IPDevice, error)
 //	network.IPDevice // io.ReadWriteCloser + MTU() int
 //
@@ -35,15 +37,16 @@
 package tunstack
 
 import (
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"net"
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/Jigsaw-Code/outline-sdk/network"
-	"github.com/Jigsaw-Code/outline-sdk/network/dnstruncate"
 	"github.com/Jigsaw-Code/outline-sdk/network/lwip2transport"
 	"github.com/Jigsaw-Code/outline-sdk/transport"
 	"github.com/Jigsaw-Code/outline-sdk/transport/socks5"
@@ -92,9 +95,10 @@ type TunWriter interface {
 }
 
 // Tunnel pumps IP packets between the packet-tunnel flow (via TunWriter /
-// WritePacket) and the olcrtc core's loopback SOCKS5 listener.
+// WritePacket) and the engine's loopback SOCKS5 listener.
 type Tunnel struct {
 	dev     network.IPDevice
+	names   *names // answers the phone's name lookups (names.go)
 	closed  atomic.Bool
 	rxBytes atomic.Int64 // device -> TunWriter (toward the OS / packetFlow.writePackets)
 	txBytes atomic.Int64 // WritePacket -> device (from the OS / packetFlow.readPackets)
@@ -116,6 +120,15 @@ func NewTunnelAuth(socksHost string, socksPort int, user, pass string, w TunWrit
 }
 
 func newTunnel(socksHost string, socksPort int, user, pass string, w TunWriter) (*Tunnel, error) {
+	return buildTunnel(socksHost, socksPort, user, pass, w, nil, defaultTiming())
+}
+
+// buildTunnel is newTunnel with what the tests replace: the authorities an
+// HTTPS resolver's certificate is checked against (nil: the system's) and the
+// waits of the lookups.
+func buildTunnel(socksHost string, socksPort int, user, pass string, w TunWriter,
+	roots *x509.CertPool, timing namesTiming,
+) (*Tunnel, error) {
 	if w == nil {
 		return nil, errors.New("tunstack: TunWriter is required")
 	}
@@ -129,14 +142,14 @@ func newTunnel(socksHost string, socksPort int, user, pass string, w TunWriter) 
 		return nil, ErrTunnelActive
 	}
 
+	listener := net.JoinHostPort(socksHost, strconv.Itoa(socksPort))
+
 	// socks5.NewClient(transport.StreamEndpoint) (*Client, error) — v0.0.20.
 	// The *Client implements transport.StreamDialer, which is exactly what
-	// lwip2transport.ConfigureDevice wants for TCP flows. No SetCredentials:
-	// loopback listeners need none (and the core enforces creds only for
-	// non-loopback binds).
+	// lwip2transport.ConfigureDevice wants for TCP flows.
 	client, err := socks5.NewClient(&transport.StreamDialerEndpoint{
 		Dialer:  &transport.TCPDialer{},
-		Address: net.JoinHostPort(socksHost, strconv.Itoa(socksPort)),
+		Address: listener,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("tunstack: socks5 client: %w", err)
@@ -147,21 +160,26 @@ func newTunnel(socksHost string, socksPort int, user, pass string, w TunWriter) 
 		}
 	}
 
-	// UDP handler: DNS gets a TC-bit reply (OS retries over TCP:53, which
-	// rides the SOCKS tunnel); every other UDP packet is dropped.
-	packetProxy, err := dnstruncate.NewPacketProxy()
+	// Name lookups: answered here through the same listener, over UDP and
+	// over TCP to port 53 alike; every other UDP packet is dropped.
+	dial, err := socksDial(listener, user, pass)
 	if err != nil {
-		return nil, fmt.Errorf("tunstack: dnstruncate proxy: %w", err)
+		return nil, fmt.Errorf("tunstack: socks5 client for lookups: %w", err)
 	}
+	lookups := newNames(dial, roots, timing)
 
-	dev, err := lwip2transport.ConfigureDevice(client, packetProxy)
+	dev, err := lwip2transport.ConfigureDevice(&nameDialer{r: lookups, next: client}, lookups)
 	if err != nil {
+		lookups.close()
 		return nil, fmt.Errorf("tunstack: configure lwIP device: %w", err)
 	}
 
-	t := &Tunnel{dev: dev}
+	t := &Tunnel{dev: dev, names: lookups}
 	active = t
 	go t.readPump(w)
+	// The first lookups of the phone find a resolver already chosen and its
+	// connection made.
+	go lookups.check(lookups.t.lookup)
 	return t, nil
 }
 
@@ -213,12 +231,43 @@ func (t *Tunnel) RxBytes() int64 { return t.rxBytes.Load() }
 // (traffic flowing from the OS). Safe to call from any thread.
 func (t *Tunnel) TxBytes() int64 { return t.txBytes.Load() }
 
-// Close shuts the lwIP device down (the pump goroutine then exits on io.EOF)
-// and releases the per-process singleton slot. Idempotent.
+// NamesAnswered returns how many name lookups of the phone a resolver has
+// answered through the session. Safe to call from any thread.
+func (t *Tunnel) NamesAnswered() int64 { return t.names.answered.Load() }
+
+// NamesFailed returns how many name lookups of the phone no resolver
+// answered: the phone was told "server failure". Safe to call from any thread.
+func (t *Tunnel) NamesFailed() int64 { return t.names.failed.Load() }
+
+// NamesVia returns the resolver behind the latest answer and the way it was
+// asked, as a line for the log: "cloudflare-dns.com over HTTPS" or "8.8.8.8
+// over TCP". Empty until the first answer.
+func (t *Tunnel) NamesVia() string {
+	via, _ := t.names.via.Load().(string)
+	return described(via)
+}
+
+// CheckNames asks a resolver for the root's name servers through the session
+// and reports whether an answer came back within timeoutMs. An answer proves
+// the session carries data both ways and that the phone has names; the
+// address in the settings need not be reachable for it, only one of the
+// resolvers this layer asks. It blocks: call it off the packet path.
+func (t *Tunnel) CheckNames(timeoutMs int) bool {
+	if t.closed.Load() || timeoutMs <= 0 {
+		return false
+	}
+	return t.names.check(time.Duration(timeoutMs) * time.Millisecond)
+}
+
+// Close ends the lookups, shuts the lwIP device down (the pump goroutine then
+// exits on io.EOF) and releases the per-process singleton slot. Idempotent.
 func (t *Tunnel) Close() error {
 	if !t.closed.CompareAndSwap(false, true) {
 		return nil
 	}
+	// First: a reply must not reach the stack's UDP socket after the device
+	// has freed it.
+	t.names.close()
 	err := t.dev.Close()
 	activeMu.Lock()
 	if active == t {

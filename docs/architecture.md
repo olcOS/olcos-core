@@ -100,6 +100,32 @@ the protobuf config directly instead of loading JSON.
 
 The apps use variant B today.
 
+## Name lookups in VPN mode
+
+`mobile/tunstack` carries TCP, and a name lookup leaves the phone over UDP. So
+tunstack answers the lookup itself (`names.go`): it asks a resolver through
+the session and hands the reply back as the UDP answer the system waits for.
+Resolvers are asked in this order:
+
+1. over HTTPS, the operator of the DNS address from the app's settings, when
+   that address is Cloudflare's, Google's, Quad9's or Yandex's; any other
+   address is asked first as it is, over TCP;
+2. over HTTPS, Cloudflare and then Google;
+3. over TCP port 53, `8.8.8.8`, `9.9.9.9` and the address from the settings.
+
+The next resolver is asked as well when the one before fails, refuses or stays
+silent for a second and a half, and one that failed is asked last for a while.
+Over HTTPS the server sees a connection to the resolver, the certificate is
+checked on the phone, and the names stay unread; over TCP the server can read
+them. A lookup for IPv6 addresses gets an empty answer at once, because the
+tunnel carries IPv4 only. Other UDP is dropped.
+
+It was different before: the lookup was answered "truncated" and the system
+repeated it over TCP to the address from the settings. A server that does not
+reach that one address left the phone without names while the session carried
+traffic. `Tunnel.CheckNames` asks through the same resolvers, so the apps'
+session watch does not take such a server for a dead session.
+
 ## Xray server
 
 `server/xray/install.sh` installs VLESS + REALITY + XTLS-Vision in Podman from

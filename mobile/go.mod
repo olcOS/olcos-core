@@ -25,6 +25,7 @@ require (
 	github.com/olcOS/olcos-core v0.0.0-00010101000000-000000000000
 	github.com/openlibrecommunity/olcrtc v0.0.0-00010101000000-000000000000
 	golang.org/x/mobile v0.0.0-20260520154334-0e4426e1883d
+	golang.org/x/net v0.62.0
 )
 
 require (
@@ -130,7 +131,6 @@ require (
 	golang.org/x/crypto/x509roots/fallback v0.0.0-20261020153306-9f2b28d4331a // indirect
 	golang.org/x/exp v0.0.0-20260603202125-055de637280b // indirect
 	golang.org/x/mod v0.41.0 // indirect
-	golang.org/x/net v0.62.0 // indirect
 	golang.org/x/sync v0.24.0 // indirect
 	golang.org/x/sys v0.49.0 // indirect
 	golang.org/x/text v0.43.0 // indirect
