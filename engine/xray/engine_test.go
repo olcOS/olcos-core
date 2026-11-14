@@ -15,18 +15,20 @@ import (
 )
 
 type testHost struct {
-	tun   int
-	mu    sync.Mutex
-	logs  []string
-	notes []string
+	tun    int
+	mu     sync.Mutex
+	logs   []string
+	levels []int
+	notes  []string
 }
 
 func (h *testHost) Protect(int) error { return nil }
 func (h *testHost) TunFD() int        { return h.tun }
-func (h *testHost) Log(_ int, msg string) {
+func (h *testHost) Log(level int, msg string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.logs = append(h.logs, msg)
+	h.levels = append(h.levels, level)
 }
 func (h *testHost) Notify(kind, payload string) {
 	h.mu.Lock()
@@ -123,6 +125,60 @@ func TestHealthEventAfterCloseIsDropped(t *testing.T) {
 	h.mu.Unlock()
 	if after != before {
 		t.Fatalf("host was notified of %d health events after Close", after-before)
+	}
+}
+
+// TestPerConnectionLinesGoOutAsDebug: xray-core names every site an app opens
+// at INFO. Those lines must reach the host as debug, which the apps do not
+// keep, while a failure on a connection keeps its level and is still read for
+// a health event.
+func TestPerConnectionLinesGoOutAsDebug(t *testing.T) {
+	const refused = "[3184868754] app/proxyman/outbound: failed to process outbound traffic > proxy/vless/outbound: failed to find an available destination > dial tcp 203.0.113.1:443: connect: connection refused"
+	cases := []struct {
+		severity xlog.Severity
+		content  string
+		want     int
+	}{
+		{xlog.Severity_Info, "[3184868754] proxy/socks: TCP Connect request to tcp:example.com:443", 3},
+		{xlog.Severity_Info, "[3184868754] app/dispatcher: default route for tcp:example.com:443", 3},
+		{xlog.Severity_Info, "[3184868754] transport/internet/tcp: dialing TCP to tcp:203.0.113.1:443", 3},
+		{xlog.Severity_Info, "[3184868754] proxy/vless/outbound: tunneling request to tcp:example.com:443 via 203.0.113.1:443", 3},
+		{xlog.Severity_Info, refused, 2},
+		{xlog.Severity_Info, "app/proxyman/inbound: listening TCP on 127.0.0.1:1080", 2},
+		{xlog.Severity_Info, "[a note] in brackets is not a connection", 2},
+		{xlog.Severity_Warning, "[3184868754] proxy/socks: TCP Connect request to tcp:example.com:443", 1},
+		{xlog.Severity_Error, "[3184868754] proxy/socks: TCP Connect request to tcp:example.com:443", 0},
+		{xlog.Severity_Debug, "app/dispatcher: default route for tcp:example.com:443", 3},
+	}
+	h := &testHost{tun: -1}
+	for _, c := range cases {
+		handle(h, nil, &xlog.GeneralMessage{Severity: c.severity, Content: c.content})
+	}
+	if len(h.levels) != len(cases) {
+		t.Fatalf("the host got %d lines, want %d", len(h.levels), len(cases))
+	}
+	for i, c := range cases {
+		if h.levels[i] != c.want {
+			t.Errorf("%v %q went out at level %d, want %d", c.severity, c.content, h.levels[i], c.want)
+		}
+	}
+
+	sess, err := Engine{}.Start(context.Background(), testProfile(), h)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() { _ = sess.Close() }()
+	sinkMu.RLock()
+	live := active
+	sinkMu.RUnlock()
+	handle(h, live, &xlog.GeneralMessage{Severity: xlog.Severity_Info, Content: refused})
+	select {
+	case ev := <-sess.Health():
+		if ev.Reason != ReasonHostUnreachable {
+			t.Fatalf("health reason %q, want %q", ev.Reason, ReasonHostUnreachable)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a failure on a connection gave no health event")
 	}
 }
 

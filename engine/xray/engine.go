@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -73,8 +74,12 @@ func handle(h engine.Host, s *session, msg xlog.Message) {
 		}
 	}
 	text := msg.String()
+	inspect := level <= 2
+	if level == 2 && perConnection(text) {
+		level = 3
+	}
 	h.Log(level, text)
-	if level > 2 || s == nil {
+	if !inspect || s == nil {
 		return
 	}
 	if reason, ok := classify(text); ok && s.emitter.offer(reason) {
@@ -86,6 +91,24 @@ func handle(h engine.Host, s *session, msg xlog.Message) {
 			h.Notify("health", string(b))
 		}
 	}
+}
+
+// perConnection reports an INFO line xray-core writes for every connection an
+// app opens: "TCP Connect request to …", "default route for …", "dialing TCP
+// to …", "tunneling request to … via …". With a browser running that is
+// hundreds of lines a minute, each naming a site the user opened, so the host
+// gets them as debug. Such lines start with the connection's number; one that
+// tells of a failure keeps its level.
+func perConnection(text string) bool {
+	rest, ok := strings.CutPrefix(text, "[Info] [")
+	if !ok {
+		return false
+	}
+	id, rest, ok := strings.Cut(rest, "] ")
+	if !ok || id == "" || strings.Trim(id, "0123456789") != "" {
+		return false
+	}
+	return !strings.Contains(strings.ToLower(rest), "failed")
 }
 
 // Kind reports engine.KindXray.

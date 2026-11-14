@@ -21,8 +21,8 @@ const (
 
 // classify maps an xray-core warning/error line to a HealthReason. Order
 // matters: the first matching rule wins. Substrings come from xray-core
-// transport/internet/reality/reality.go, proxy/vless/outbound/outbound.go and
-// Go's net package error texts.
+// transport/internet/reality/reality.go, proxy/vless/outbound/outbound.go,
+// the websocket and grpc transports, and Go's net and crypto/tls error texts.
 //
 // xray-core logs dial failures at INFO ("failed to process outbound traffic >
 // failed to find an available destination > dial tcp …: connection refused",
@@ -41,6 +41,13 @@ func classify(msg string) (string, bool) {
 		strings.Contains(m, "reality: processed invalid connection"),
 		strings.Contains(m, "reality: sharedkey == nil"),
 		strings.Contains(m, "reality: publickey == nil"):
+		return ReasonKeyMismatch, true
+	// The same for a server behind TLS: its certificate is not one for the
+	// link's name, or it answers but knows no such path or service. Either
+	// way the link no longer describes this server.
+	case strings.Contains(m, "failed to verify certificate"),
+		strings.Contains(m, "websocket: bad handshake"),
+		strings.Contains(m, "code = unimplemented"):
 		return ReasonKeyMismatch, true
 	// Failures between a local app and our SOCKS inbound — an app closing its
 	// connection early ("write tcp 127.0.0.1:…: broken pipe") or idling past

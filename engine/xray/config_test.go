@@ -127,9 +127,215 @@ func TestValidateProfile(t *testing.T) {
 		t.Error("missing pbk must fail")
 	}
 	bad = sample()
-	bad.Params[ParamNetwork] = "xhttp"
+	bad.Params[ParamNetwork] = "kcp"
 	if err := ValidateProfile(bad); err == nil {
-		t.Error("xhttp is not supported yet")
+		t.Error("an unknown transport must fail")
+	}
+	bad = sample()
+	bad.Params[ParamNetwork] = "ws"
+	if err := ValidateProfile(bad); err == nil {
+		t.Error("REALITY does not run over WebSocket")
+	}
+	bad = behindCDN()
+	bad.Params[ParamSecurity] = "none"
+	if err := ValidateProfile(bad); err == nil {
+		t.Error("VLESS without TLS must fail")
+	}
+	for _, network := range []string{"grpc", "xhttp"} {
+		ok := sample()
+		ok.Params[ParamNetwork] = network
+		if err := ValidateProfile(ok); err != nil {
+			t.Errorf("REALITY over %s: %v", network, err)
+		}
+	}
+}
+
+// behindCDN is a server as public lists carry them: VLESS in a WebSocket
+// under TLS, the address a CDN's, no REALITY key at all.
+func behindCDN() engine.Profile {
+	return engine.Profile{
+		Kind: engine.KindXray, Host: "198.51.100.20", Port: 443,
+		Secret: "8f3f2c1e-7a5b-4d2e-9c1a-0b6d5e4f3a21",
+		Params: map[string]string{
+			ParamSecurity: "tls", ParamNetwork: "ws", ParamSNI: "cdn.example.com",
+			ParamHost: "cdn.example.com", ParamPath: "/tunnel?ed=2048", ParamFingerprint: "firefox",
+			ParamALPN: "http/1.1",
+		},
+	}
+}
+
+// stream is the streamSettings of the rendered config's first outbound.
+func stream(t *testing.T, p engine.Profile) (settings map[string]any, flow string) {
+	t.Helper()
+	out, err := RenderClientConfig(p, ClientOptions{SocksPort: 1080, TunFD: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg struct {
+		Outbounds []struct {
+			Settings struct {
+				Vnext []struct {
+					Users []struct {
+						Flow string `json:"flow"`
+					} `json:"users"`
+				} `json:"vnext"`
+			} `json:"settings"`
+			StreamSettings map[string]any `json:"streamSettings"`
+		} `json:"outbounds"`
+	}
+	if err := json.Unmarshal(out, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	return cfg.Outbounds[0].StreamSettings, cfg.Outbounds[0].Settings.Vnext[0].Users[0].Flow
+}
+
+func TestRenderClientBehindCDN(t *testing.T) {
+	settings, flow := stream(t, behindCDN())
+	if settings["network"] != "ws" || settings["security"] != "tls" {
+		t.Fatalf("network and security: %v", settings)
+	}
+	if _, has := settings["realitySettings"]; has {
+		t.Error("a TLS server has no REALITY settings")
+	}
+	tls := settings["tlsSettings"].(map[string]any)
+	if tls["serverName"] != "cdn.example.com" || tls["fingerprint"] != "firefox" {
+		t.Errorf("tlsSettings: %v", tls)
+	}
+	if alpn, _ := tls["alpn"].([]any); len(alpn) != 1 || alpn[0] != "http/1.1" {
+		t.Errorf("alpn: %v", tls["alpn"])
+	}
+	if _, has := tls["allowInsecure"]; has {
+		t.Error("the certificate is always verified")
+	}
+	ws := settings["wsSettings"].(map[string]any)
+	if ws["path"] != "/tunnel?ed=2048" || ws["host"] != "cdn.example.com" {
+		t.Errorf("wsSettings: %v", ws)
+	}
+	// Vision runs over plain TCP only.
+	if flow != "" {
+		t.Errorf("flow over WebSocket: %q", flow)
+	}
+}
+
+func TestRenderClientTransports(t *testing.T) {
+	p := behindCDN()
+	p.Params[ParamNetwork] = "httpupgrade"
+	settings, _ := stream(t, p)
+	if hu := settings["httpupgradeSettings"].(map[string]any); hu["path"] != "/tunnel?ed=2048" || hu["host"] != "cdn.example.com" {
+		t.Errorf("httpupgradeSettings: %v", hu)
+	}
+
+	p = behindCDN()
+	p.Params[ParamNetwork], p.Params[ParamMode] = "xhttp", "packet-up"
+	settings, _ = stream(t, p)
+	if x := settings["xhttpSettings"].(map[string]any); x["path"] != "/tunnel?ed=2048" || x["mode"] != "packet-up" {
+		t.Errorf("xhttpSettings: %v", x)
+	}
+
+	// The names clients wrote before xray-core renamed its transports.
+	p = behindCDN()
+	p.Params[ParamNetwork] = "websocket"
+	if settings, _ = stream(t, p); settings["network"] != "ws" || settings["wsSettings"] == nil {
+		t.Errorf("websocket: %v", settings)
+	}
+
+	p = sample()
+	p.Params[ParamNetwork], p.Params[ParamServiceName], p.Params[ParamMode] = "grpc", "tunnel", "multi"
+	settings, flow := stream(t, p)
+	if settings["security"] != "reality" || settings["realitySettings"] == nil {
+		t.Errorf("REALITY over gRPC: %v", settings)
+	}
+	if g := settings["grpcSettings"].(map[string]any); g["serviceName"] != "tunnel" || g["multiMode"] != true {
+		t.Errorf("grpcSettings: %v", g)
+	}
+	if flow != "" {
+		t.Errorf("flow over gRPC: %q", flow)
+	}
+
+	// A TLS server over plain TCP keeps the flow its link names, none included.
+	p = behindCDN()
+	p.Params[ParamNetwork] = "tcp"
+	if _, flow = stream(t, p); flow != "" {
+		t.Errorf("a TLS link without a flow got %q", flow)
+	}
+	// REALITY over TCP without one still gets Vision, as before.
+	if _, flow = stream(t, sample()); flow != "xtls-rprx-vision" {
+		t.Errorf("REALITY over TCP: flow %q", flow)
+	}
+}
+
+func TestTLSNameFallsBackToTheHostHeaderThenTheAddress(t *testing.T) {
+	p := behindCDN()
+	delete(p.Params, ParamSNI)
+	settings, _ := stream(t, p)
+	if name := settings["tlsSettings"].(map[string]any)["serverName"]; name != "cdn.example.com" {
+		t.Errorf("without sni: %v", name)
+	}
+	delete(p.Params, ParamHost)
+	p.Host = "edge.example.net"
+	settings, _ = stream(t, p)
+	if name := settings["tlsSettings"].(map[string]any)["serverName"]; name != "edge.example.net" {
+		t.Errorf("without sni and host: %v", name)
+	}
+	if _, has := settings["wsSettings"].(map[string]any)["host"]; has {
+		t.Error("no Host header was named")
+	}
+}
+
+// A list writes any browser name; one Xray does not know must not cost the
+// connection.
+func TestAnUnknownFingerprintBecomesTheDefault(t *testing.T) {
+	cases := map[string]string{
+		"": "chrome", "chrome": "chrome", "Firefox": "firefox", "qq": "qq", "ios": "ios",
+		"netscape": "chrome", "unsafe": "chrome", "hellogolang": "chrome",
+	}
+	for in, want := range cases {
+		for _, p := range []engine.Profile{sample(), behindCDN()} {
+			p.Params[ParamFingerprint] = in
+			settings, _ := stream(t, p)
+			block, _ := settings["realitySettings"].(map[string]any)
+			if block == nil {
+				block = settings["tlsSettings"].(map[string]any)
+			}
+			if got := block["fingerprint"]; got != want {
+				t.Errorf("fp %q over %v: %v, want %q", in, settings["security"], got, want)
+			}
+		}
+	}
+}
+
+func TestXHTTPExtraIsPassedOnWhenItIsAnObject(t *testing.T) {
+	p := behindCDN()
+	p.Params[ParamNetwork] = "xhttp"
+	p.Params[ParamExtra] = `{"xPaddingBytes":"100-1000","noGRPCHeader":true}`
+	settings, _ := stream(t, p)
+	extra, _ := settings["xhttpSettings"].(map[string]any)["extra"].(map[string]any)
+	if extra["xPaddingBytes"] != "100-1000" || extra["noGRPCHeader"] != true {
+		t.Errorf("extra: %v", settings["xhttpSettings"])
+	}
+	for _, bad := range []string{"", "nonsense", `["a"]`, `{"open":`} {
+		p.Params[ParamExtra] = bad
+		settings, _ = stream(t, p)
+		if _, has := settings["xhttpSettings"].(map[string]any)["extra"]; has {
+			t.Errorf("extra %q was passed on", bad)
+		}
+	}
+}
+
+func TestALPNList(t *testing.T) {
+	cases := map[string][]string{
+		"":                           nil,
+		"http/1.1":                   {"http/1.1"},
+		"h2,http/1.1":                {"h2", "http/1.1"},
+		"h3%2Ch2%2Chttp%2F1.1":       {"h3", "h2", "http/1.1"},
+		"http%2525252525252F1.1":     {"http/1.1"},
+		"H2, h2 ,nonsense,http/1.1 ": {"h2", "http/1.1"},
+		"%zz":                        nil,
+	}
+	for raw, want := range cases {
+		if got := alpnList(raw); !slices.Equal(got, want) {
+			t.Errorf("alpnList(%q) = %v, want %v", raw, got, want)
+		}
 	}
 }
 

@@ -2,6 +2,7 @@ package profile
 
 import (
 	"encoding/base64"
+	"strings"
 	"testing"
 
 	"github.com/olcOS/olcos-core/engine"
@@ -39,15 +40,64 @@ func TestParseVLESSRoundTrip(t *testing.T) {
 
 func TestParseVLESSRejects(t *testing.T) {
 	cases := map[string]string{
-		"duplicate key": "vless://8f3f2c1e-7a5b-4d2e-9c1a-0b6d5e4f3a21@h:443?security=reality&sni=a&sni=b",
-		"tls security":  "vless://8f3f2c1e-7a5b-4d2e-9c1a-0b6d5e4f3a21@h:443?security=tls&sni=a",
-		"no port":       "vless://8f3f2c1e-7a5b-4d2e-9c1a-0b6d5e4f3a21@h?security=reality",
-		"encryption":    "vless://8f3f2c1e-7a5b-4d2e-9c1a-0b6d5e4f3a21@h:443?security=reality&encryption=aes",
+		"duplicate key":   "vless://8f3f2c1e-7a5b-4d2e-9c1a-0b6d5e4f3a21@h:443?security=reality&sni=a&sni=b",
+		"no security":     "vless://8f3f2c1e-7a5b-4d2e-9c1a-0b6d5e4f3a21@h:443?security=none&type=ws",
+		"security unsaid": "vless://8f3f2c1e-7a5b-4d2e-9c1a-0b6d5e4f3a21@h:443?type=ws&path=%2F",
+		"no port":         "vless://8f3f2c1e-7a5b-4d2e-9c1a-0b6d5e4f3a21@h?security=reality",
+		"encryption":      "vless://8f3f2c1e-7a5b-4d2e-9c1a-0b6d5e4f3a21@h:443?security=reality&encryption=aes",
 	}
 	for name, raw := range cases {
 		if _, err := ParseVLESS(raw); err == nil {
 			t.Errorf("%s: expected error", name)
 		}
+	}
+}
+
+// A server from a public list: VLESS in a WebSocket under TLS, behind a CDN.
+func TestParseVLESSBehindCDN(t *testing.T) {
+	const link = "vless://8f3f2c1e-7a5b-4d2e-9c1a-0b6d5e4f3a21@198.51.100.20:443?encryption=none&security=tls&sni=cdn.example.com&fp=firefox&alpn=http%2F1.1&type=ws&host=cdn.example.com&path=%2Ftunnel%3Fed%3D2048&allowInsecure=0#list%20server"
+	p, err := ParseVLESS(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Params["security"] != "tls" || p.Params["type"] != "ws" || p.Params["path"] != "/tunnel?ed=2048" ||
+		p.Params["host"] != "cdn.example.com" || p.Params["alpn"] != "http/1.1" || p.Name != "list server" {
+		t.Fatalf("bad params: %+v", p)
+	}
+	if err := xray.ValidateProfile(p); err != nil {
+		t.Fatalf("the Xray engine should take it: %v", err)
+	}
+	out, err := ExportVLESS(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(out, "vless://8f3f2c1e-7a5b-4d2e-9c1a-0b6d5e4f3a21@198.51.100.20:443?encryption=none&security=tls&") ||
+		strings.Count(out, "security=") != 1 {
+		t.Fatalf("export: %q", out)
+	}
+	again, err := ParseVLESS(out)
+	if err != nil {
+		t.Fatalf("re-parse %q: %v", out, err)
+	}
+	for _, key := range []string{"security", "type", "path", "host", "alpn", "sni", "fp"} {
+		if again.Params[key] != p.Params[key] {
+			t.Errorf("%s: %q became %q", key, p.Params[key], again.Params[key])
+		}
+	}
+}
+
+// A REALITY profile does not carry the word, so what it exports is what it
+// always exported.
+func TestParseVLESSKeepsRealityUnsaid(t *testing.T) {
+	p, err := ParseVLESS(sampleVLESS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, has := p.Params["security"]; has {
+		t.Fatalf("security kept on a REALITY profile: %+v", p.Params)
+	}
+	if xray.Security(p) != xray.SecurityReality || xray.Network(p) != "tcp" {
+		t.Fatalf("security %q, network %q", xray.Security(p), xray.Network(p))
 	}
 }
 

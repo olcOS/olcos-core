@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
+	"syscall"
 	"time"
 
 	"github.com/xtls/xray-core/core"
@@ -22,9 +24,14 @@ import (
 // GET a 204 URL through the tunnel, one warm-up request, then the best of
 // three samples over the warmed connection. Measuring both protocols the same
 // way is what lets the app say which one is faster right now.
+//
+// The warm-up has more time than a sample: it sets the whole path up (the
+// handshake with the server, a WebSocket upgrade behind a CDN, the handshake
+// with the target), which on a mobile network takes seconds. A server that
+// needs two of them is slow, not dead.
 const (
 	DefaultPingURL    = "https://www.google.com/generate_204"
-	pingWarmupTimeout = 1500 * time.Millisecond
+	pingWarmupTimeout = 4 * time.Second
 	pingSampleTimeout = 1500 * time.Millisecond
 	pingSamples       = 3
 	pingSampleDelay   = 80 * time.Millisecond
@@ -45,30 +52,9 @@ func Ping(ctx context.Context, p engine.Profile, targetURL string) (int64, error
 	if u, err := url.ParseRequestURI(targetURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") {
 		return 0, fmt.Errorf("xray: ping URL %q is not http(s)", targetURL)
 	}
-	port, err := freePort()
+	inst, port, user, pass, err := startProbe(p)
 	if err != nil {
 		return 0, err
-	}
-	// loglevel none: this instance must not feed the running session's log
-	// sink, where its failures would read as health events of that session.
-	// Throwaway credentials: no other local client may use this listener
-	// while it lives.
-	user, pass := rand.Text(), rand.Text()
-	raw, err := RenderClientConfig(p, ClientOptions{SocksPort: port, TunFD: -1, LogLevel: "none", SocksUser: user, SocksPass: pass})
-	if err != nil {
-		return 0, err
-	}
-	cfg, err := core.LoadConfig("json", bytes.NewReader(raw))
-	if err != nil {
-		return 0, fmt.Errorf("xray: load config: %w", err)
-	}
-	inst, err := core.New(cfg)
-	if err != nil {
-		return 0, fmt.Errorf("xray: new instance: %w", err)
-	}
-	if err := inst.Start(); err != nil {
-		_ = inst.Close()
-		return 0, fmt.Errorf("xray: start: %w", err)
 	}
 	defer inst.Close()
 
@@ -76,8 +62,8 @@ func Ping(ctx context.Context, p engine.Profile, targetURL string) (int64, error
 		Proxy:                 http.ProxyURL(&url.URL{Scheme: "socks5", User: url.UserPassword(user, pass), Host: net.JoinHostPort("127.0.0.1", strconv.Itoa(port))}),
 		MaxIdleConnsPerHost:   4,
 		IdleConnTimeout:       10 * time.Second,
-		TLSHandshakeTimeout:   pingSampleTimeout,
-		ResponseHeaderTimeout: pingSampleTimeout,
+		TLSHandshakeTimeout:   pingWarmupTimeout,
+		ResponseHeaderTimeout: pingWarmupTimeout,
 	}
 	defer transport.CloseIdleConnections()
 	client := &http.Client{
@@ -85,17 +71,76 @@ func Ping(ctx context.Context, p engine.Profile, targetURL string) (int64, error
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
 
+	return measure(ctx, client, targetURL)
+}
+
+// probeStartTries is how many local ports a probe tries: several probes run
+// side by side when the app looks through a list, and two of them can be
+// handed the same free port.
+const probeStartTries = 3
+
+// startProbe brings up the temporary client of a ping on a free local port.
+func startProbe(p engine.Profile) (inst *core.Instance, port int, user, pass string, err error) {
+	for try := 0; try < probeStartTries; try++ {
+		if port, err = freePort(); err != nil {
+			return nil, 0, "", "", err
+		}
+		// loglevel none: this instance must not feed the running session's
+		// log sink, where its failures would read as health events of that
+		// session. Throwaway credentials: no other local client may use this
+		// listener while it lives.
+		user, pass = rand.Text(), rand.Text()
+		var raw []byte
+		raw, err = RenderClientConfig(p, ClientOptions{SocksPort: port, TunFD: -1, LogLevel: "none", SocksUser: user, SocksPass: pass})
+		if err != nil {
+			return nil, 0, "", "", err
+		}
+		var cfg *core.Config
+		if cfg, err = core.LoadConfig("json", bytes.NewReader(raw)); err != nil {
+			return nil, 0, "", "", fmt.Errorf("xray: load config: %w", err)
+		}
+		if inst, err = core.New(cfg); err != nil {
+			return nil, 0, "", "", fmt.Errorf("xray: new instance: %w", err)
+		}
+		if err = inst.Start(); err == nil {
+			return inst, port, user, pass, nil
+		}
+		_ = inst.Close()
+		err = fmt.Errorf("xray: start: %w", err)
+		if !portTaken(err) {
+			break
+		}
+	}
+	return nil, 0, "", "", err
+}
+
+// portTaken says whether a start failed because another listener took the
+// port between its choice and its use.
+func portTaken(err error) bool {
+	return errors.Is(err, syscall.EADDRINUSE) || strings.Contains(err.Error(), "address already in use")
+}
+
+// measure is the warm-up and the samples over an HTTP client that already
+// goes through the tunnel.
+func measure(ctx context.Context, client *http.Client, targetURL string) (int64, error) {
 	_, warmErr := pingOnce(ctx, client, targetURL, pingWarmupTimeout)
+	samples := pingSamples
+	if warmErr != nil {
+		// Nothing answered in the time a slow path needs. One more try
+		// covers a path that came up just after; three would only make a
+		// dead server slower to name.
+		samples = 1
+	}
 	var best int64
 	lastErr := warmErr
-	for i := 0; i < pingSamples; i++ {
+	for i := 0; i < samples; i++ {
 		elapsed, err := pingOnce(ctx, client, targetURL, pingSampleTimeout)
 		if err != nil {
 			lastErr = err
 		} else if elapsed > 0 && (best == 0 || elapsed < best) {
 			best = elapsed
 		}
-		if i < pingSamples-1 && !sleepCtx(ctx, pingSampleDelay) {
+		if i < samples-1 && !sleepCtx(ctx, pingSampleDelay) {
 			break
 		}
 	}

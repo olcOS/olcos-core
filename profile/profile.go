@@ -36,8 +36,9 @@ func Parse(raw string) (engine.Profile, error) {
 }
 
 // ParseVLESS parses a vless:// share link. Keys are case-sensitive and must
-// not repeat (#716). Only fields relevant to REALITY over TCP are kept; the
-// rest are preserved verbatim in Params so export round-trips.
+// not repeat (#716). The link's protection is REALITY or TLS; every other
+// field is kept verbatim in Params, where the Xray engine reads the ones it
+// knows (transport, path, host, alpn), so export round-trips.
 func ParseVLESS(raw string) (engine.Profile, error) {
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -75,11 +76,15 @@ func ParseVLESS(raw string) (engine.Profile, error) {
 	if enc := params["encryption"]; enc != "" && enc != "none" {
 		return engine.Profile{}, fmt.Errorf("profile: unsupported encryption %q", enc)
 	}
-	if sec := params["security"]; sec != "reality" {
-		return engine.Profile{}, fmt.Errorf("profile: security %q not supported (reality only)", sec)
+	switch sec := params["security"]; sec {
+	case "reality":
+		// The default, so a REALITY profile does not carry the word.
+		delete(params, "security")
+	case "tls":
+	default:
+		return engine.Profile{}, fmt.Errorf("profile: security %q not supported (reality or tls)", sec)
 	}
 	delete(params, "encryption")
-	delete(params, "security")
 	return engine.Profile{
 		Kind:   engine.KindXray,
 		Name:   u.Fragment,
@@ -100,8 +105,12 @@ func ExportVLESS(p engine.Profile) (string, error) {
 		return "", errors.New("profile: incomplete xray profile")
 	}
 	order := []string{"flow", "sni", "fp", "pbk", "sid", "spx", "pqv", "type"}
-	q := "encryption=none&security=reality"
-	emitted := map[string]bool{}
+	security := p.Params["security"]
+	if security == "" {
+		security = "reality"
+	}
+	q := "encryption=none&security=" + url.QueryEscape(security)
+	emitted := map[string]bool{"security": true}
 	for _, k := range order {
 		if v, ok := p.Params[k]; ok && v != "" {
 			q += "&" + k + "=" + url.QueryEscape(v)

@@ -13,6 +13,10 @@ func TestClassify(t *testing.T) {
 		"[Info] app/proxyman/outbound: failed to process outbound traffic > dial tcp: lookup example.invalid: no such host":           ReasonDNSUnreachable,
 		"[Info] app/proxyman/outbound: failed to process outbound traffic > connect: network is unreachable":                          ReasonNetworkDown,
 		"[Info] app/proxyman/outbound: failed to process outbound traffic > read tcp: connection reset by peer":                       ReasonCarrierRejected,
+		// A server behind TLS that is not the one the link describes.
+		"[Error] transport/internet/websocket: failed to dial to 203.0.113.1:443 > tls: failed to verify certificate: x509: certificate is valid for other.test, not cdn.test":                                                                                                                                                                                                         ReasonKeyMismatch,
+		"[Info] app/proxyman/outbound: failed to process outbound traffic > proxy/vless/outbound: failed to find an available destination > common/retry: [transport/internet/websocket: failed to dial WebSocket > transport/internet/websocket: failed to dial to (wss://203.0.113.1:443/nope): 404 Not Found > websocket: bad handshake] > common/retry: all retry attempts failed": ReasonKeyMismatch,
+		"[Info] app/proxyman/outbound: failed to process outbound traffic > proxy/vless/outbound: connection ends > proxy/vless/outbound: failed to decode response header > proxy/vless/encoding: failed to read response version > transport/internet/grpc/encoding: failed to fetch hunk from gRPC tunnel > rpc error: code = Unimplemented desc = unknown service b":               ReasonKeyMismatch,
 	}
 	for in, want := range cases {
 		got, ok := classify(in)

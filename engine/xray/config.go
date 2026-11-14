@@ -1,5 +1,7 @@
-// Package xray implements the VLESS + REALITY + XTLS-Vision engine on top of
-// xray-core and renders the JSON configs consumed by it.
+// Package xray implements the VLESS engine on top of xray-core and renders the
+// JSON configs consumed by it: REALITY with XTLS-Vision for a server of one's
+// own, and TLS over WebSocket, gRPC, HTTPUpgrade or XHTTP for a server that
+// sits behind a CDN, which is what public lists mostly carry.
 //
 // Config field names follow the official REALITY reference
 // (https://xtls.github.io/en/config/transports/reality.html) and the
@@ -11,8 +13,12 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"net/url"
 	"regexp"
+	"slices"
 	"strings"
+
+	xtls "github.com/xtls/xray-core/transport/internet/tls"
 
 	"github.com/olcOS/olcos-core/engine"
 )
@@ -26,8 +32,17 @@ const (
 	ParamShortID     = "sid"  // realitySettings.shortId
 	ParamSpiderX     = "spx"  // realitySettings.spiderX
 	ParamFlow        = "flow" // users[].flow (default xtls-rprx-vision)
-	ParamNetwork     = "type" // streamSettings.network (only tcp for now)
+	ParamNetwork     = "type" // streamSettings.network: tcp (default), ws, grpc, httpupgrade, xhttp
 	ParamMLDSA65     = "pqv"  // realitySettings.mldsa65Verify
+
+	ParamSecurity    = "security"    // streamSettings.security: reality (default) or tls
+	ParamHost        = "host"        // Host header of ws, httpupgrade and xhttp
+	ParamPath        = "path"        // path of ws, httpupgrade and xhttp
+	ParamALPN        = "alpn"        // tlsSettings.alpn, comma-separated
+	ParamServiceName = "serviceName" // grpcSettings.serviceName
+	ParamAuthority   = "authority"   // grpcSettings.authority
+	ParamMode        = "mode"        // grpc: gun or multi; xhttp: its own mode
+	ParamExtra       = "extra"       // xhttpSettings.extra, a JSON object
 
 	// ParamDirect is not a share-link field: the app sets it at engine.start
 	// to the destinations a session reaches directly, never through the
@@ -40,6 +55,37 @@ const (
 	defaultFingerprint = "chrome"
 	defaultSpiderX     = "/"
 )
+
+// How the connection to the server is protected.
+const (
+	SecurityReality = "reality"
+	SecurityTLS     = "tls"
+)
+
+// Security says how p's connection to the server is protected. A profile
+// that does not say is REALITY: every link written before TLS was accepted.
+func Security(p engine.Profile) string {
+	if s := strings.ToLower(strings.TrimSpace(p.Params[ParamSecurity])); s != "" {
+		return s
+	}
+	return SecurityReality
+}
+
+// Network names the transport under VLESS in the words of a share link:
+// tcp, ws, grpc, httpupgrade or xhttp. The older names clients still write
+// are folded into these.
+func Network(p engine.Profile) string {
+	switch n := strings.ToLower(strings.TrimSpace(p.Params[ParamNetwork])); n {
+	case "", "raw":
+		return "tcp"
+	case "websocket":
+		return "ws"
+	case "splithttp":
+		return "xhttp"
+	default:
+		return n
+	}
+}
 
 var (
 	uuidRe    = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
@@ -79,14 +125,29 @@ func ValidateProfile(p engine.Profile) error {
 	if p.Port <= 0 || p.Port > 65535 {
 		return fmt.Errorf("xray: invalid port %d", p.Port)
 	}
-	if p.Params[ParamPublicKey] == "" {
-		return errors.New("xray: missing pbk (REALITY public key)")
+	network := Network(p)
+	switch network {
+	case "tcp", "ws", "grpc", "httpupgrade", "xhttp":
+	default:
+		return fmt.Errorf("xray: network %q not supported", network)
 	}
-	if sid := p.Params[ParamShortID]; !shortIDRe.MatchString(sid) {
-		return fmt.Errorf("xray: shortId %q must be 0..16 hex chars, even length", sid)
-	}
-	if n := p.Params[ParamNetwork]; n != "" && n != "tcp" && n != "raw" {
-		return fmt.Errorf("xray: network %q not supported yet (tcp/raw only)", n)
+	switch security := Security(p); security {
+	case SecurityReality:
+		if p.Params[ParamPublicKey] == "" {
+			return errors.New("xray: missing pbk (REALITY public key)")
+		}
+		if sid := p.Params[ParamShortID]; !shortIDRe.MatchString(sid) {
+			return fmt.Errorf("xray: shortId %q must be 0..16 hex chars, even length", sid)
+		}
+		// xray-core carries REALITY over these three only.
+		if network != "tcp" && network != "grpc" && network != "xhttp" {
+			return fmt.Errorf("xray: REALITY does not run over %q", network)
+		}
+	case SecurityTLS:
+	default:
+		// No plain VLESS: without TLS the server sees, and anyone on the
+		// path can read, every destination.
+		return fmt.Errorf("xray: security %q not supported (reality or tls)", security)
 	}
 	return nil
 }
@@ -104,12 +165,6 @@ func RenderClientConfig(p engine.Profile, o ClientOptions) ([]byte, error) {
 	}
 	if len(o.SocksUser) > 255 || len(o.SocksPass) > 255 {
 		return nil, errors.New("xray: SOCKS username and password are 255 bytes at most")
-	}
-	get := func(k, def string) string {
-		if v := p.Params[k]; v != "" {
-			return v
-		}
-		return def
 	}
 	level := o.LogLevel
 	if level == "" {
@@ -147,17 +202,6 @@ func RenderClientConfig(p engine.Profile, o ClientOptions) ([]byte, error) {
 		}
 	}
 
-	reality := map[string]any{
-		"serverName":  p.Params[ParamSNI],
-		"fingerprint": get(ParamFingerprint, defaultFingerprint),
-		"password":    p.Params[ParamPublicKey],
-		"shortId":     p.Params[ParamShortID],
-		"spiderX":     get(ParamSpiderX, defaultSpiderX),
-	}
-	if v := p.Params[ParamMLDSA65]; v != "" {
-		reality["mldsa65Verify"] = v
-	}
-
 	cfg := map[string]any{
 		// No access log: it would put every destination the phone visits
 		// into the app's log.
@@ -175,12 +219,10 @@ func RenderClientConfig(p engine.Profile, o ClientOptions) ([]byte, error) {
 				"settings": map[string]any{"vnext": []any{map[string]any{
 					"address": p.Host, "port": p.Port,
 					"users": []any{map[string]any{
-						"id": p.Secret, "encryption": "none", "flow": get(ParamFlow, defaultFlow),
+						"id": p.Secret, "encryption": "none", "flow": flow(p),
 					}},
 				}}},
-				"streamSettings": map[string]any{
-					"network": "tcp", "security": "reality", "realitySettings": reality,
-				},
+				"streamSettings": streamSettings(p),
 			},
 			map[string]any{"tag": "direct", "protocol": "freedom"},
 			map[string]any{"tag": "block", "protocol": "blackhole"},
@@ -198,6 +240,124 @@ func RenderClientConfig(p engine.Profile, o ClientOptions) ([]byte, error) {
 		cfg["routing"] = map[string]any{"domainStrategy": "AsIs", "rules": rules}
 	}
 	return json.MarshalIndent(cfg, "", "  ")
+}
+
+// flow is the VLESS flow of p. Vision runs over plain TCP only; a REALITY
+// link that names none gets it, as every server the app sets up uses it.
+func flow(p engine.Profile) string {
+	if Network(p) != "tcp" {
+		return ""
+	}
+	if f := p.Params[ParamFlow]; f != "" || Security(p) != SecurityReality {
+		return f
+	}
+	return defaultFlow
+}
+
+// fingerprint is the browser whose TLS hello the client imitates. A name
+// Xray does not know would fail the whole config, so it becomes the default.
+func fingerprint(p engine.Profile) string {
+	name := strings.ToLower(strings.TrimSpace(p.Params[ParamFingerprint]))
+	if name == "" || name == "unsafe" || name == "hellogolang" || xtls.GetFingerprint(name) == nil {
+		return defaultFingerprint
+	}
+	return name
+}
+
+// streamSettings renders how p reaches its server: the protection (REALITY
+// or TLS) and the transport under it.
+func streamSettings(p engine.Profile) map[string]any {
+	get := func(k, def string) string {
+		if v := p.Params[k]; v != "" {
+			return v
+		}
+		return def
+	}
+	network := Network(p)
+	stream := map[string]any{"network": network}
+	if Security(p) == SecurityTLS {
+		// The name on the certificate: the link's sni, else the Host header
+		// it sends, else the address itself. The certificate is always
+		// verified; a link asking to skip that is not obeyed.
+		name := p.Params[ParamSNI]
+		if name == "" {
+			name = get(ParamHost, p.Host)
+		}
+		tls := map[string]any{"serverName": name, "fingerprint": fingerprint(p)}
+		if alpn := alpnList(p.Params[ParamALPN]); len(alpn) > 0 {
+			tls["alpn"] = alpn
+		}
+		stream["security"], stream["tlsSettings"] = SecurityTLS, tls
+	} else {
+		reality := map[string]any{
+			"serverName":  p.Params[ParamSNI],
+			"fingerprint": fingerprint(p),
+			"password":    p.Params[ParamPublicKey],
+			"shortId":     p.Params[ParamShortID],
+			"spiderX":     get(ParamSpiderX, defaultSpiderX),
+		}
+		if v := p.Params[ParamMLDSA65]; v != "" {
+			reality["mldsa65Verify"] = v
+		}
+		stream["security"], stream["realitySettings"] = SecurityReality, reality
+	}
+	hostPath := func() map[string]any {
+		out := map[string]any{"path": get(ParamPath, "/")}
+		if h := p.Params[ParamHost]; h != "" {
+			out["host"] = h
+		}
+		return out
+	}
+	switch network {
+	case "ws":
+		stream["wsSettings"] = hostPath()
+	case "httpupgrade":
+		stream["httpupgradeSettings"] = hostPath()
+	case "xhttp":
+		settings := hostPath()
+		if m := p.Params[ParamMode]; m != "" {
+			settings["mode"] = m
+		}
+		// What else the server expects of XHTTP (padding, headers) rides in
+		// the link as a JSON object.
+		if e := strings.TrimSpace(p.Params[ParamExtra]); strings.HasPrefix(e, "{") && json.Valid([]byte(e)) {
+			settings["extra"] = json.RawMessage(e)
+		}
+		stream["xhttpSettings"] = settings
+	case "grpc":
+		settings := map[string]any{"serviceName": p.Params[ParamServiceName]}
+		if a := p.Params[ParamAuthority]; a != "" {
+			settings["authority"] = a
+		}
+		if p.Params[ParamMode] == "multi" {
+			settings["multiMode"] = true
+		}
+		stream["grpcSettings"] = settings
+	}
+	return stream
+}
+
+// alpnList splits a link's alpn value. Lists pass it around percent-encoded
+// again and again (http%25252F1.1), so it is decoded until it stops
+// changing; anything that is not a protocol name TLS knows is dropped.
+func alpnList(raw string) []string {
+	for i := 0; i < 32 && strings.Contains(raw, "%"); i++ {
+		dec, err := url.QueryUnescape(raw)
+		if err != nil || dec == raw {
+			break
+		}
+		raw = dec
+	}
+	var out []string
+	for _, part := range strings.Split(raw, ",") {
+		switch name := strings.ToLower(strings.TrimSpace(part)); name {
+		case "h2", "h3", "http/1.1":
+			if !slices.Contains(out, name) {
+				out = append(out, name)
+			}
+		}
+	}
+	return out
 }
 
 // directRules splits the app's direct list. It is the olcrtc core's syntax —
